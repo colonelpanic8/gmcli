@@ -31,6 +31,12 @@
             "-X github.com/fdsouvenir/gmcli/cmd.Version=${version}"
           ];
 
+          # Keep source-default assertions meaningful. buildGoModule otherwise
+          # passes the release linker flags to both the binary and go test.
+          preCheck = ''
+            ldflags=(-buildid=)
+          '';
+
           meta = {
             description = "Local-first Google Messages CLI and archive";
             homepage = "https://github.com/fdsouvenir/gmcli";

@@ -45,6 +45,18 @@ roughly every 14 days of inactivity (Google's policy, not ours).
 
 Requires Go 1.25 or newer.
 
+With Nix, run gmcli directly or install the default flake package:
+
+```sh
+nix run github:fdsouvenir/gmcli -- --help
+nix profile install github:fdsouvenir/gmcli
+```
+
+The flake publishes `packages.<system>.gmcli`, a default package and app, and
+`overlays.default` for NixOS or nix-darwin configurations.
+
+To build from source without Nix:
+
 ```sh
 git clone https://github.com/fdsouvenir/gmcli
 cd gmcli

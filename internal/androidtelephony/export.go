@@ -4,6 +4,7 @@ package androidtelephony
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha256"
 	_ "embed"
@@ -235,10 +236,34 @@ func runHelper(ctx context.Context, adb, serial string, includePartData bool, co
 		return fmt.Errorf("start Android Telephony helper: %w", err)
 	}
 	consumeErr := consume(stdout)
+	// The summary is terminal, so the consumer may finish before app_process
+	// closes stdout. Close our pipe end and give the helper a short grace period;
+	// older embedded helpers did not call System.exit and otherwise waited
+	// forever on Android runtime threads after producing a complete archive.
+	_ = stdout.Close()
 	if consumeErr != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
 	}
-	runErr := cmd.Wait()
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	var runErr error
+	if consumeErr != nil {
+		runErr = <-wait
+	} else {
+		timer := time.NewTimer(helperExitGracePeriod)
+		select {
+		case runErr = <-wait:
+			timer.Stop()
+		case <-timer.C:
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			<-wait
+			// A complete, validated summary is authoritative. A forced exit
+			// after that marker only cleans up a stuck Android runtime.
+			runErr = nil
+		}
+	}
 	if consumeErr != nil {
 		return consumeErr
 	}
@@ -249,6 +274,7 @@ func runHelper(ctx context.Context, adb, serial string, includePartData bool, co
 }
 
 const cleanupTimeout = 10 * time.Second
+const helperExitGracePeriod = 2 * time.Second
 
 type limitedWriter struct {
 	dst       io.Writer
@@ -271,6 +297,95 @@ type outputFile struct {
 	path    string
 	file    *os.File
 	records int
+	recent  *list.Element
+}
+
+const maxOpenSegmentFiles = 32
+
+// outputFiles keeps record counts for every archive file while bounding the
+// number of descriptors used by interleaved thread records. Evicted files are
+// reopened in append-only mode when another record arrives for that thread.
+type outputFiles struct {
+	dir    string
+	limit  int
+	files  map[string]*outputFile
+	recent *list.List
+	open   int
+}
+
+func newOutputFiles(dir string, limit int) *outputFiles {
+	if limit < 1 {
+		limit = 1
+	}
+	return &outputFiles{dir: dir, limit: limit, files: make(map[string]*outputFile), recent: list.New()}
+}
+
+func (outputs *outputFiles) write(key string, data []byte) error {
+	output := outputs.files[key]
+	if output == nil {
+		output = &outputFile{path: key}
+		outputs.files[key] = output
+	}
+	if err := outputs.openFile(output); err != nil {
+		return err
+	}
+	if _, err := output.file.Write(data); err != nil {
+		return fmt.Errorf("write %s: %w", key, err)
+	}
+	output.records++
+	outputs.recent.MoveToFront(output.recent)
+	return nil
+}
+
+func (outputs *outputFiles) openFile(output *outputFile) error {
+	if output.file != nil {
+		return nil
+	}
+	if outputs.open >= outputs.limit {
+		oldest := outputs.recent.Back()
+		if oldest == nil {
+			return errors.New("internal error: segment file LRU is empty at its descriptor limit")
+		}
+		if err := outputs.closeFile(oldest.Value.(*outputFile)); err != nil {
+			return err
+		}
+	}
+	flags := os.O_WRONLY | os.O_APPEND
+	if output.records == 0 {
+		flags = os.O_CREATE | os.O_EXCL | os.O_WRONLY
+	}
+	file, err := os.OpenFile(filepath.Join(outputs.dir, filepath.FromSlash(output.path)), flags, 0o600)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", output.path, err)
+	}
+	output.file = file
+	output.recent = outputs.recent.PushFront(output)
+	outputs.open++
+	return nil
+}
+
+func (outputs *outputFiles) closeFile(output *outputFile) error {
+	if output.file == nil {
+		return nil
+	}
+	err := output.file.Close()
+	output.file = nil
+	outputs.recent.Remove(output.recent)
+	output.recent = nil
+	outputs.open--
+	if err != nil {
+		return fmt.Errorf("close %s: %w", output.path, err)
+	}
+	return nil
+}
+
+func (outputs *outputFiles) closeAll() error {
+	for outputs.recent.Len() > 0 {
+		if err := outputs.closeFile(outputs.recent.Back().Value.(*outputFile)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func segmentRaw(raw io.Reader, dir, serial string) (Result, manifest, error) {
@@ -282,12 +397,8 @@ func segmentRaw(raw io.Reader, dir, serial string) (Result, manifest, error) {
 	if err := os.MkdirAll(mediaDir, 0o700); err != nil {
 		return Result{}, manifest{}, err
 	}
-	files := make(map[string]*outputFile)
-	defer func() {
-		for _, output := range files {
-			_ = output.file.Close()
-		}
-	}()
+	outputs := newOutputFiles(dir, maxOpenSegmentFiles)
+	defer func() { _ = outputs.closeAll() }()
 	mmsThreads := make(map[int64]string)
 	result := Result{DeviceSerial: serial, FormatVersion: 1}
 	complete := false
@@ -305,6 +416,7 @@ func segmentRaw(raw io.Reader, dir, serial string) (Result, manifest, error) {
 			return Result{}, manifest{}, fmt.Errorf("invalid helper JSONL at line %d: %w", lineNumber, err)
 		}
 		var threadID string
+		orphanedMMS := false
 		var err error
 		switch record.RecordType {
 		case "sms", "mms", "thread":
@@ -333,7 +445,10 @@ func segmentRaw(raw io.Reader, dir, serial string) (Result, manifest, error) {
 			}
 			threadID = mmsThreads[*record.MMSID]
 			if threadID == "" {
-				return Result{}, manifest{}, fmt.Errorf("line %d: MMS %d has no thread mapping", lineNumber, *record.MMSID)
+				// Android's Telephony provider can retain part/address rows whose
+				// parent MMS row has already disappeared. Preserve those source
+				// records globally instead of silently losing archive data.
+				orphanedMMS = true
 			}
 		case "summary":
 			var summary struct {
@@ -377,25 +492,23 @@ func segmentRaw(raw io.Reader, dir, serial string) (Result, manifest, error) {
 			line = append(line, '\n')
 		}
 		key := "metadata.jsonl"
-		if threadID != "" {
+		if orphanedMMS {
+			key = "orphaned-mms.jsonl"
+		} else if threadID != "" {
 			key = filepath.ToSlash(filepath.Join("threads", base64.RawURLEncoding.EncodeToString([]byte(threadID))+".jsonl"))
 		} else if record.RecordType == "canonical_address" {
 			key = "canonical-addresses.jsonl"
 		}
-		output := files[key]
-		if output == nil {
-			file, err := os.OpenFile(filepath.Join(dir, filepath.FromSlash(key)), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-			if err != nil {
-				return Result{}, manifest{}, err
-			}
-			output = &outputFile{path: key, file: file}
-			files[key] = output
-		}
-		if _, err := output.file.Write(line); err != nil {
+		if err := outputs.write(key, line); err != nil {
 			return Result{}, manifest{}, err
 		}
-		output.records++
 		result.Records++
+		if complete {
+			// A successful summary is the terminal protocol record. Returning
+			// here prevents a misbehaving app_process from holding the reader
+			// open forever after it has delivered the complete export.
+			break
+		}
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
@@ -403,17 +516,17 @@ func segmentRaw(raw io.Reader, dir, serial string) (Result, manifest, error) {
 	if !complete {
 		return Result{}, manifest{}, errors.New("helper output is incomplete (missing successful summary)")
 	}
-	for _, output := range files {
-		if err := output.file.Sync(); err != nil {
-			return Result{}, manifest{}, err
-		}
-		if err := output.file.Close(); err != nil {
-			return Result{}, manifest{}, err
-		}
+	// Closing all writers before checksumming gives the manifest a stable view
+	// of every file. The temporary tree and final rename provide archive-level
+	// atomicity; an fsync for every thread would only add an O(thread count)
+	// durability stall while the manifest itself is not a crash-consistent
+	// filesystem transaction.
+	if err := outputs.closeAll(); err != nil {
+		return Result{}, manifest{}, err
 	}
 	archiveManifest := manifest{Format: "gmcli-android-telephony", FormatVersion: 1, DeviceSerial: serial}
-	keys := make([]string, 0, len(files))
-	for key := range files {
+	keys := make([]string, 0, len(outputs.files))
+	for key := range outputs.files {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
@@ -422,7 +535,7 @@ func segmentRaw(raw io.Reader, dir, serial string) (Result, manifest, error) {
 		if err != nil {
 			return Result{}, manifest{}, err
 		}
-		entry := manifestFile{Path: key, Records: files[key].records, Bytes: info.Size(), SHA256: checksum}
+		entry := manifestFile{Path: key, Records: outputs.files[key].records, Bytes: info.Size(), SHA256: checksum}
 		if strings.HasPrefix(key, "threads/") {
 			encoded := strings.TrimSuffix(filepath.Base(key), ".jsonl")
 			decoded, err := base64.RawURLEncoding.DecodeString(encoded)

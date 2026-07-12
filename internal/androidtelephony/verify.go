@@ -152,7 +152,13 @@ func Verify(path string) (VerifyResult, error) {
 			mediaDeclared[file.Path] = file
 			result.MediaFiles++
 			result.MediaBytes += file.Bytes
-		} else if strings.HasSuffix(file.Path, ".jsonl") {
+		}
+	}
+	// Collect every content-addressed object before inspecting references.
+	// Global orphan records may refer to media just like per-thread records do,
+	// while manifest ordering is intentionally not semantically significant.
+	for _, file := range archiveManifest.Files {
+		if !strings.HasPrefix(file.Path, "media/") && strings.HasSuffix(file.Path, ".jsonl") {
 			count, err := verifyGlobalJSONL(filepath.Join(abs, filepath.FromSlash(file.Path)), file.Path, mediaReferenced, mediaDeclared)
 			if err != nil {
 				return VerifyResult{}, err
@@ -228,6 +234,15 @@ func verifyGlobalJSONL(path, manifestPath string, mediaReferenced map[string]boo
 		case "canonical-addresses.jsonl":
 			if record.RecordType != "canonical_address" {
 				return fmt.Errorf("unexpected canonical-address record type %q", record.RecordType)
+			}
+		case "orphaned-mms.jsonl":
+			switch record.RecordType {
+			case "mms_address", "mms_part", "mms_part_data":
+				if record.MMSID == nil {
+					return fmt.Errorf("orphaned %s lacks mms_id", record.RecordType)
+				}
+			default:
+				return fmt.Errorf("unexpected orphaned-MMS record type %q", record.RecordType)
 			}
 		default:
 			return fmt.Errorf("unexpected global JSONL file %q", manifestPath)

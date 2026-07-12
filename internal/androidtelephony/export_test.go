@@ -5,11 +5,54 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestOutputFilesBoundsDescriptorsAndAppends(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "threads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outputs := newOutputFiles(dir, 2)
+	for round := 0; round < 3; round++ {
+		for thread := 0; thread < 7; thread++ {
+			key := filepath.ToSlash(filepath.Join("threads", string(rune('a'+thread))+".jsonl"))
+			if err := outputs.write(key, []byte{byte('0' + round), '\n'}); err != nil {
+				t.Fatal(err)
+			}
+			if outputs.open > 2 {
+				t.Fatalf("open descriptors = %d, want at most 2", outputs.open)
+			}
+		}
+	}
+	if err := outputs.closeAll(); err != nil {
+		t.Fatal(err)
+	}
+	if outputs.open != 0 {
+		t.Fatalf("open descriptors after close = %d", outputs.open)
+	}
+	for key, output := range outputs.files {
+		if output.records != 3 {
+			t.Fatalf("%s records = %d, want 3", key, output.records)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(key)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "0\n1\n2\n" {
+			t.Fatalf("%s contents = %q", key, data)
+		}
+		if info, err := os.Stat(filepath.Join(dir, filepath.FromSlash(key))); err != nil {
+			t.Fatal(err)
+		} else if info.Mode().Perm() != 0o600 {
+			t.Fatalf("%s permissions = %o, want 600", key, info.Mode().Perm())
+		}
+	}
+}
 
 func TestSegmentRawRoutesThreadsAndExtractsVerifiedMMSMedia(t *testing.T) {
 	dir := t.TempDir()
@@ -91,6 +134,116 @@ func TestSegmentRawRejectsCorruptMMSMedia(t *testing.T) {
 	}
 	if _, _, err := segmentRaw(strings.NewReader(strings.Join(lines, "\n")+"\n"), dir, "pixel"); err == nil || !strings.Contains(err.Error(), "verification") {
 		t.Fatalf("expected verification error, got %v", err)
+	}
+}
+
+func TestSegmentRawPreservesOrphanedMMSRowsAndMedia(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("orphaned attachment")
+	digest := sha256.Sum256(payload)
+	checksum := hex.EncodeToString(digest[:])
+	lines := []string{
+		`{"record_type":"metadata","format":"gmcli-android-telephony","format_version":1,"device_serial":"pixel"}`,
+		`{"record_type":"mms_address","mms_id":99,"values":{"_id":{"type":"integer","value":10}}}`,
+		`{"record_type":"mms_part","mms_id":99,"values":{"_id":{"type":"integer","value":11},"mid":{"type":"integer","value":99}}}`,
+		`{"record_type":"mms_part_data","source_uri":"content://mms/part/11","part_id":11,"mms_id":99,"encoding":"base64","data":"` + base64.StdEncoding.EncodeToString(payload) + `","byte_length":19,"sha256":"` + checksum + `"}`,
+		`{"record_type":"summary","complete":true}`,
+	}
+	result, archiveManifest, err := segmentRaw(strings.NewReader(strings.Join(lines, "\n")+"\n"), dir, "pixel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Threads != 0 || result.Records != len(lines) || result.MediaFiles != 1 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	var orphanFile manifestFile
+	for _, file := range archiveManifest.Files {
+		if file.Path == "orphaned-mms.jsonl" {
+			orphanFile = file
+		}
+	}
+	if orphanFile.Path == "" || orphanFile.Records != 3 {
+		t.Fatalf("unexpected orphan manifest entry: %+v", orphanFile)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "orphaned-mms.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), base64.StdEncoding.EncodeToString(payload)) || !strings.Contains(string(data), `"media_path":"media/`+checksum+`"`) {
+		t.Fatalf("orphan JSONL did not replace payload with media reference: %s", data)
+	}
+	if err := writeManifest(filepath.Join(dir, "manifest.json"), archiveManifest); err != nil {
+		t.Fatal(err)
+	}
+	verified, err := Verify(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Records != result.Records || verified.MediaFiles != 1 {
+		t.Fatalf("unexpected verification result: %+v", verified)
+	}
+}
+
+func TestSegmentRawTreatsCompleteSummaryAsTerminal(t *testing.T) {
+	input := &terminalSummaryReader{data: []byte("{\"record_type\":\"metadata\"}\n{\"record_type\":\"summary\",\"complete\":true}\n")}
+	result, _, err := segmentRaw(input, t.TempDir(), "pixel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Records != 2 || input.readAfterData {
+		t.Fatalf("result = %+v, read after terminal summary = %v", result, input.readAfterData)
+	}
+}
+
+type terminalSummaryReader struct {
+	data          []byte
+	readAfterData bool
+}
+
+func (reader *terminalSummaryReader) Read(p []byte) (int, error) {
+	if len(reader.data) == 0 {
+		reader.readAfterData = true
+		return 0, errors.New("read after terminal summary")
+	}
+	n := copy(p, reader.data)
+	reader.data = reader.data[n:]
+	return n, nil
+}
+
+func TestSegmentRawManyThreadsWithBoundedDescriptors(t *testing.T) {
+	const threadCount = 1500
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lines := make([]string, 0, threadCount+2)
+	lines = append(lines, `{"record_type":"metadata","format":"gmcli-android-telephony","format_version":1,"device_serial":"pixel"}`)
+	for thread := 1; thread <= threadCount; thread++ {
+		lines = append(lines, row("sms", map[string]int64{"_id": int64(thread), "thread_id": int64(thread)}))
+	}
+	lines = append(lines, `{"record_type":"summary","complete":true}`)
+	result, archiveManifest, err := segmentRaw(strings.NewReader(strings.Join(lines, "\n")+"\n"), dir, "pixel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Threads != threadCount || result.Records != threadCount+2 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if len(archiveManifest.Threads) != threadCount {
+		t.Fatalf("manifest threads = %d, want %d", len(archiveManifest.Threads), threadCount)
+	}
+	if err := writeManifest(filepath.Join(dir, "manifest.json"), archiveManifest); err != nil {
+		t.Fatal(err)
+	}
+	verified, err := Verify(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Threads != threadCount || verified.Records != result.Records {
+		t.Fatalf("unexpected verification result: %+v", verified)
 	}
 }
 

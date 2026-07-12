@@ -62,6 +62,10 @@ public final class TelephonyExport {
             TelephonyExport exporter = new TelephonyExport();
             exporter.parseArgs(args);
             exporter.run();
+            // app_process initializes Android binder/runtime threads which may
+            // keep the VM alive after main returns. The summary has been
+            // flushed at this point, so terminate explicitly.
+            System.exit(0);
         } catch (Throwable t) {
             t.printStackTrace(System.err);
             System.exit(2);

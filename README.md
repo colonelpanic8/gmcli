@@ -126,6 +126,8 @@ gmcli contacts alias rm --id <pid>
 
 # 5. Best-effort history backfill, modeled after wacli.
 gmcli history backfill --chat <conv-id> --requests 10 --count 50
+gmcli history backfill-all --requests 20 --count 100
+gmcli coverage verify
 # JSON output reports protocol records separately from the chat message delta:
 # fetched_messages, sync_records_processed, messages_before, messages_after,
 # messages_added_for_chat.
@@ -162,6 +164,7 @@ gmcli export jsonl --out ~/Backups/gmcli/latest --force
 gmcli export verify --dir ~/Backups/gmcli/latest
 gmcli coverage
 gmcli --json coverage --conversation <conv-id>
+gmcli coverage verify
 ```
 
 Coverage is evidence-based and is never inferred from message counts. Each
@@ -171,6 +174,29 @@ that conversation's available history. Request budgets, repeated/missing
 cursors, authentication failures, and folder timeouts remain explicitly
 partial or failed. Archives created before coverage tracking therefore migrate
 as `not_attempted` until those conversations are traversed again.
+
+For SMS/MMS, Android's Telephony provider is an independent source that can
+contain older or hidden threads not returned by the Messages web relay. With
+USB or wireless debugging enabled, gmcli can export it directly through adb.
+The helper is read-only, runs as Android's shell user, and is removed after the
+export. Output is atomically replaced, uses one JSONL file per Telephony
+thread, preserves every provider column with an explicit value type, and can
+optionally include content-addressed MMS attachments:
+
+```sh
+gmcli android export-telephony --out ~/Backups/gmcli/telephony --force
+gmcli android verify-telephony --dir ~/Backups/gmcli/telephony
+
+# Keep message/text metadata but omit binary MMS part bodies:
+gmcli android export-telephony --out ~/Backups/gmcli/telephony-jsonl \
+  --force --include-part-data=false
+```
+
+The Telephony export is complementary to relay history: it is authoritative
+for locally stored SMS/MMS, while the relay remains necessary for RCS chats.
+`gmcli coverage verify` is the final relay completeness gate; it exits nonzero
+unless Inbox, Archive, and Spam discovery are complete and every known relay
+conversation has reached an empty history page.
 
 ## Global flags
 
@@ -186,12 +212,13 @@ as `not_attempted` until those conversations are traversed again.
 
 ```
 cmd/                  Cobra command tree (auth, sync, version, doctor,
-                      messages, contacts, chats, send, media, export)
+                      messages, contacts, chats, send, media, export, android)
 internal/
+  androidtelephony/    Verified, segmented Android SMS/MMS provider export
   archive/             Portable JSON snapshot export
   gm/                 libgm wrapper — pairing, session, events, send/react,
                       WaitForReady, DownloadMedia
-  store/              SQLite + FTS5 store (schema v3: aliases + send settings cache)
+  store/              SQLite + FTS5 store (schema v4: aliases, send cache, coverage)
   sync/               Event-to-store pump
   output/             Shared JSON / tab-aligned table renderers
   paths/              XDG path resolution (XDG_STATE_HOME)

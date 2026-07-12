@@ -247,6 +247,80 @@ func TestSegmentRawManyThreadsWithBoundedDescriptors(t *testing.T) {
 	}
 }
 
+func TestInstallDirectoryRejectsInvalidCandidateBeforeReplacingDestination(t *testing.T) {
+	parent := t.TempDir()
+	destination := filepath.Join(parent, "archive")
+	tmp := filepath.Join(parent, "candidate")
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destination, "existing"), []byte("good"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "manifest.json"), []byte("not JSON"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := installDirectory(tmp, destination, true)
+	if err == nil || !strings.Contains(err.Error(), "pre-install") {
+		t.Fatalf("expected pre-install verification failure, got %v", err)
+	}
+	if data, readErr := os.ReadFile(filepath.Join(destination, "existing")); readErr != nil || string(data) != "good" {
+		t.Fatalf("existing archive was replaced: data=%q err=%v", data, readErr)
+	}
+	if _, statErr := os.Stat(tmp); statErr != nil {
+		t.Fatalf("candidate should remain available to caller cleanup: %v", statErr)
+	}
+	if backups, globErr := filepath.Glob(filepath.Join(parent, ".archive.old-*")); globErr != nil || len(backups) != 0 {
+		t.Fatalf("unexpected backup debris: paths=%v err=%v", backups, globErr)
+	}
+}
+
+func TestInstallDirectoryRollsBackPostInstallVerificationFailure(t *testing.T) {
+	parent := t.TempDir()
+	destination := filepath.Join(parent, "archive")
+	tmp := filepath.Join(parent, "candidate")
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destination, "existing"), []byte("good"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "candidate"), []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	verificationCalls := 0
+	err := installDirectoryWithVerifier(tmp, destination, true, func(string) error {
+		verificationCalls++
+		if verificationCalls == 2 {
+			return errors.New("simulated post-install corruption")
+		}
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("expected rolled-back post-install failure, got %v", err)
+	}
+	if verificationCalls != 2 {
+		t.Fatalf("verification calls = %d, want 2", verificationCalls)
+	}
+	if data, readErr := os.ReadFile(filepath.Join(destination, "existing")); readErr != nil || string(data) != "good" {
+		t.Fatalf("existing archive was not restored: data=%q err=%v", data, readErr)
+	}
+	if data, readErr := os.ReadFile(filepath.Join(tmp, "candidate")); readErr != nil || string(data) != "new" {
+		t.Fatalf("failed candidate was not moved back for cleanup: data=%q err=%v", data, readErr)
+	}
+	if backups, globErr := filepath.Glob(filepath.Join(parent, ".archive.old-*")); globErr != nil || len(backups) != 0 {
+		t.Fatalf("unexpected backup debris: paths=%v err=%v", backups, globErr)
+	}
+}
+
 func row(recordType string, values map[string]int64) string {
 	typed := make(map[string]map[string]any, len(values))
 	for key, value := range values {

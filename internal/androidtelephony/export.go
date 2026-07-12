@@ -151,9 +151,6 @@ func Export(ctx context.Context, options Options) (Result, error) {
 		return Result{}, err
 	}
 	installed = true
-	if _, err := Verify(abs); err != nil {
-		return Result{}, fmt.Errorf("post-install Telephony archive verification failed: %w", err)
-	}
 	result.Path = abs
 	return result, nil
 }
@@ -602,20 +599,88 @@ func writeManifest(path string, value manifest) error {
 }
 
 func installDirectory(tmp, destination string, force bool) error {
-	if !force {
-		return os.Rename(tmp, destination)
+	return installDirectoryWithVerifier(tmp, destination, force, func(path string) error {
+		_, err := Verify(path)
+		return err
+	})
+}
+
+func installDirectoryWithVerifier(tmp, destination string, force bool, verify func(string) error) error {
+	if err := verify(tmp); err != nil {
+		return fmt.Errorf("pre-install Telephony archive verification failed: %w", err)
 	}
-	backup := destination + ".old"
-	_ = os.RemoveAll(backup)
+	if !force {
+		if err := os.Rename(tmp, destination); err != nil {
+			return fmt.Errorf("install export: %w", err)
+		}
+		if err := verify(destination); err != nil {
+			if rollbackErr := os.Rename(destination, tmp); rollbackErr != nil {
+				return errors.Join(
+					fmt.Errorf("post-install Telephony archive verification failed: %w", err),
+					fmt.Errorf("remove failed installation during rollback: %w", rollbackErr),
+				)
+			}
+			return fmt.Errorf("post-install Telephony archive verification failed (installation rolled back): %w", err)
+		}
+		return nil
+	}
+
+	backupFile, err := os.CreateTemp(filepath.Dir(destination), "."+filepath.Base(destination)+".old-*")
+	if err != nil {
+		return fmt.Errorf("reserve backup path: %w", err)
+	}
+	backup := backupFile.Name()
+	if err := backupFile.Close(); err != nil {
+		_ = os.Remove(backup)
+		return fmt.Errorf("reserve backup path: %w", err)
+	}
+	if err := os.Remove(backup); err != nil {
+		return fmt.Errorf("reserve backup path: %w", err)
+	}
+
+	hadExisting := true
 	if err := os.Rename(destination, backup); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("preserve existing export: %w", err)
+	} else if os.IsNotExist(err) {
+		hadExisting = false
 	}
 	if err := os.Rename(tmp, destination); err != nil {
-		_ = os.Rename(backup, destination)
-		return fmt.Errorf("install export: %w", err)
+		if hadExisting {
+			if rollbackErr := os.Rename(backup, destination); rollbackErr != nil {
+				return errors.Join(
+					fmt.Errorf("install export: %w", err),
+					fmt.Errorf("restore existing export from %s: %w", backup, rollbackErr),
+				)
+			}
+		}
+		return fmt.Errorf("install export (existing export restored): %w", err)
 	}
-	if err := os.RemoveAll(backup); err != nil {
-		return fmt.Errorf("remove replaced export: %w", err)
+	if err := verify(destination); err != nil {
+		verificationErr := fmt.Errorf("post-install Telephony archive verification failed: %w", err)
+		if rollbackErr := os.Rename(destination, tmp); rollbackErr != nil {
+			if hadExisting {
+				return errors.Join(verificationErr, fmt.Errorf("failed installation could not be removed; existing export remains at %s: %w", backup, rollbackErr))
+			}
+			return errors.Join(verificationErr, fmt.Errorf("failed installation could not be removed: %w", rollbackErr))
+		}
+		if hadExisting {
+			if rollbackErr := os.Rename(backup, destination); rollbackErr != nil {
+				return errors.Join(verificationErr, fmt.Errorf("existing export remains at %s after rollback failed: %w", backup, rollbackErr))
+			}
+		}
+		return fmt.Errorf("post-install Telephony archive verification failed (installation rolled back): %w", err)
+	}
+	if hadExisting {
+		if err := os.RemoveAll(backup); err != nil {
+			return fmt.Errorf("remove replaced export: %w", err)
+		}
+	}
+	if !hadExisting {
+		// The reserved path was already removed, but keep this explicit so a
+		// future change to backup allocation cannot leave debris behind.
+		if err := os.RemoveAll(backup); err != nil {
+			return fmt.Errorf("remove unused export backup: %w", err)
+		}
 	}
 	return nil
 }

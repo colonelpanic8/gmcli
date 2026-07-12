@@ -185,6 +185,41 @@ func TestHistoryPageBoundsOverlapCursorBoundary(t *testing.T) {
 	}
 }
 
+func TestOldestMessageCursorSynthesizesMissingRelayCursor(t *testing.T) {
+	messages := []*gmproto.Message{
+		{MessageID: "new", Timestamp: 1_700_000_000_003_000},
+		{MessageID: "old", Timestamp: 1_700_000_000_001_000},
+		{MessageID: "middle", Timestamp: 1_700_000_000_002_000},
+	}
+	got := oldestMessageCursor(messages)
+	if got == nil || got.GetLastItemID() != "old" || got.GetLastItemTimestamp() != 1_700_000_000_001 {
+		t.Fatalf("oldest cursor = %v, want old at millisecond timestamp", got)
+	}
+	if !cursorMovesBackward(nil, got) {
+		t.Fatal("synthesized initial cursor must be usable")
+	}
+}
+
+func TestCursorMovesBackwardRejectsNonProgress(t *testing.T) {
+	current := &gmproto.Cursor{LastItemID: "anchor", LastItemTimestamp: 1_000}
+	for name, test := range map[string]struct {
+		next *gmproto.Cursor
+		want bool
+	}{
+		"older":          {next: &gmproto.Cursor{LastItemID: "older", LastItemTimestamp: 999}, want: true},
+		"same":           {next: &gmproto.Cursor{LastItemID: "anchor", LastItemTimestamp: 1_000}, want: false},
+		"same timestamp": {next: &gmproto.Cursor{LastItemID: "peer", LastItemTimestamp: 1_000}, want: true},
+		"newer":          {next: &gmproto.Cursor{LastItemID: "newer", LastItemTimestamp: 1_001}, want: false},
+		"missing":        {next: nil, want: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := cursorMovesBackward(current, test.next); got != test.want {
+				t.Fatalf("cursorMovesBackward() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestTerminalSessionErrorsStopResumableBackfill(t *testing.T) {
 	for _, message := range []string{
 		"fetch messages: HTTP 401: invalid authentication credentials",

@@ -287,7 +287,7 @@ func runHistoryBackfillAll(requests int, count int64, offset, limit int, include
 		result.NextAfterConversationID = nextHistoryBackfillCursor(result.NextAfterConversationID, conversation.ID, outcome)
 	}
 	if result.Failed > 0 || result.NeedsMore > 0 {
-		return result, fmt.Errorf("history backfill pass incomplete: %d conversation(s) failed and %d reached the request limit before exhaustion", result.Failed, result.NeedsMore)
+		return result, fmt.Errorf("history backfill pass incomplete: %d conversation(s) failed and %d need more history", result.Failed, result.NeedsMore)
 	}
 	return result, nil
 }
@@ -416,9 +416,14 @@ func runHistoryBackfillConnected(ctx context.Context, st *store.Store, client *g
 				return res, fmt.Errorf("record coverage page: %w", err)
 			}
 		}
-		if sameCursor(cursor, next) {
-			res.CoverageStatus, res.TerminalReason = store.CoveragePartial, "same_cursor"
-			if err := st.FinishConversationCoverage(ctx, chat, res.CoverageStatus, res.TerminalReason, nil, res.Requests, res.FetchedMessages, ""); err != nil {
+		if !cursorMovesBackward(cursor, next) {
+			next = oldestMessageCursor(msgs)
+		}
+		if cursor != nil && (next == nil || !cursorMovesBackward(cursor, next)) {
+			historyStart := normalizeHistoryTimestampMS(cursor.GetLastItemTimestamp())
+			res.CoverageStatus, res.TerminalReason = store.CoverageSourceExhausted, "no_older_messages"
+			res.Exhausted = true
+			if err := st.FinishConversationCoverage(ctx, chat, res.CoverageStatus, res.TerminalReason, &historyStart, res.Requests, res.FetchedMessages, ""); err != nil {
 				return res, err
 			}
 			break
@@ -521,4 +526,36 @@ func sameCursor(a, b *gmproto.Cursor) bool {
 	}
 	return a.GetLastItemID() == b.GetLastItemID() &&
 		a.GetLastItemTimestamp() == b.GetLastItemTimestamp()
+}
+
+func oldestMessageCursor(messages []*gmproto.Message) *gmproto.Cursor {
+	var oldest *gmproto.Message
+	var oldestMS int64
+	for _, message := range messages {
+		if message == nil || message.GetMessageID() == "" {
+			continue
+		}
+		ts := normalizeHistoryTimestampMS(message.GetTimestamp())
+		if ts <= 0 || (oldest != nil && ts > oldestMS) {
+			continue
+		}
+		oldest = message
+		oldestMS = ts
+	}
+	if oldest == nil {
+		return nil
+	}
+	return &gmproto.Cursor{LastItemID: oldest.GetMessageID(), LastItemTimestamp: oldestMS}
+}
+
+func cursorMovesBackward(current, next *gmproto.Cursor) bool {
+	if next == nil || next.GetLastItemID() == "" {
+		return false
+	}
+	if current == nil {
+		return normalizeHistoryTimestampMS(next.GetLastItemTimestamp()) > 0
+	}
+	currentMS := normalizeHistoryTimestampMS(current.GetLastItemTimestamp())
+	nextMS := normalizeHistoryTimestampMS(next.GetLastItemTimestamp())
+	return nextMS < currentMS || (nextMS == currentMS && next.GetLastItemID() != current.GetLastItemID())
 }

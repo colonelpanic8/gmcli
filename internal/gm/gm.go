@@ -15,10 +15,15 @@ package gm
 
 import (
 	"context"
+	"crypto/elliptic"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -770,24 +775,191 @@ func loadAuth(path string) (*libgm.AuthData, error) {
 }
 
 func saveAuth(path string, auth *libgm.AuthData) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("create %s: %w", tmp, err)
+		return fmt.Errorf("create temporary session in %s: %w", dir, err)
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("secure temporary session %s: %w", tmp, err)
 	}
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(auth); err != nil {
 		_ = f.Close()
-		_ = os.Remove(tmp)
 		return fmt.Errorf("encode session: %w", err)
 	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync temporary session %s: %w", tmp, err)
+	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
 		return fmt.Errorf("close %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("rename %s -> %s: %w", tmp, path, err)
 	}
+	return nil
+}
+
+// RefreshSessionFromWebStorage rekeys an existing Google Account session from
+// the current Messages for Web localStorage values. Google reuses the browser
+// device ID when it is paired again, but rotates the Tachyon token, pairing ID,
+// encryption keys, and refresh key. Keeping the stale values produces a 401 or
+// messages that cannot be decrypted.
+func RefreshSessionFromWebStorage(layout paths.Layout, values map[string]string, cryptoPrefix string) error {
+	return refreshSessionFromWebStorage(layout, values, cryptoPrefix, validateAndRefreshWebStorageSession)
+}
+
+type webStorageSessionValidator func(*libgm.AuthData) error
+
+func refreshSessionFromWebStorage(layout paths.Layout, values map[string]string, cryptoPrefix string, validate webStorageSessionValidator) error {
+	existing, err := loadAuth(layout.Session)
+	if err != nil {
+		return err
+	}
+	candidate, err := applyWebStorageSession(existing, values, cryptoPrefix, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	if validate == nil {
+		return errors.New("web storage session validator is required")
+	}
+	if err := validate(candidate); err != nil {
+		return fmt.Errorf("validate refreshed Messages session: %w", err)
+	}
+	if len(candidate.TachyonAuthToken) == 0 || candidate.TachyonTTL <= 0 || !candidate.TachyonExpiry.After(time.Now().UTC()) {
+		return errors.New("validate refreshed Messages session: signed refresh did not return a usable token")
+	}
+	if err := saveAuth(layout.Session, candidate); err != nil {
+		return fmt.Errorf("persist validated Messages session: %w", err)
+	}
+	return nil
+
+}
+
+// applyWebStorageSession parses and applies browser storage to a detached copy
+// of existing. It performs no I/O, allowing callers to validate the candidate
+// before replacing the durable session.
+func applyWebStorageSession(existing *libgm.AuthData, values map[string]string, cryptoPrefix string, now time.Time) (*libgm.AuthData, error) {
+	if existing == nil || existing.SessionID == uuid.Nil || existing.DestRegID == uuid.Nil || existing.Browser == nil || existing.Mobile == nil || existing.RequestCrypto == nil || existing.RefreshKey == nil {
+		return nil, errors.New("existing account session is incomplete; pair normally before refreshing it")
+	}
+	auth, err := cloneAuthData(existing)
+	if err != nil {
+		return nil, fmt.Errorf("copy existing session: %w", err)
+	}
+	decode := func(name string) ([]byte, error) {
+		value := strings.TrimSpace(values[name])
+		if value == "" {
+			return nil, fmt.Errorf("web storage is missing %s", name)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			return nil, fmt.Errorf("decode %s: %w", name, err)
+		}
+		return decoded, nil
+	}
+	deviceData, err := decode("bg_tachyon_auth_device_id")
+	if err != nil {
+		return nil, err
+	}
+	var deviceID gmproto.SignInGaiaRequest_Inner_DeviceID
+	if err := proto.Unmarshal(deviceData, &deviceID); err != nil {
+		return nil, fmt.Errorf("decode Messages browser device: %w", err)
+	}
+	expectedDeviceID := "messages-web-" + strings.ReplaceAll(auth.SessionID.String(), "-", "")
+	if deviceID.DeviceID != expectedDeviceID {
+		return nil, errors.New("web storage belongs to a different Messages browser device")
+	}
+	if deviceID.UnknownInt1 != 3 {
+		return nil, errors.New("web storage contains an incomplete Messages browser device")
+	}
+	destRegID, err := uuid.Parse(values["bg_tachyon_dest_registration_id"])
+	if err != nil {
+		return nil, fmt.Errorf("parse destination registration id: %w", err)
+	}
+	if auth.DestRegID != uuid.Nil && auth.DestRegID != destRegID {
+		return nil, errors.New("web storage targets a different phone registration")
+	}
+	pairingID, err := uuid.Parse(values["bg_tachyon_pairing_attempt_id"])
+	if err != nil {
+		return nil, fmt.Errorf("parse pairing attempt id: %w", err)
+	}
+	aesKey, err := decode(cryptoPrefix + "crypto_msg_enc_key")
+	if err != nil {
+		return nil, err
+	}
+	hmacKey, err := decode(cryptoPrefix + "crypto_msg_hmac")
+	if err != nil {
+		return nil, err
+	}
+	privateKey, err := decode("crypto_priv_key")
+	if err != nil {
+		return nil, err
+	}
+	publicKey, err := decode("crypto_pub_key")
+	if err != nil {
+		return nil, err
+	}
+	token, err := decode("bg_tachyon_auth_token")
+	if err != nil {
+		return nil, err
+	}
+	if len(aesKey) != 32 || len(hmacKey) != 32 || len(privateKey) != 32 || len(publicKey) != 65 || publicKey[0] != 4 || len(token) == 0 {
+		return nil, errors.New("web storage contains malformed Messages session keys")
+	}
+	curve := elliptic.P256()
+	publicX, publicY := elliptic.Unmarshal(curve, publicKey)
+	privateScalar := new(big.Int).SetBytes(privateKey)
+	if publicX == nil || privateScalar.Sign() <= 0 || privateScalar.Cmp(curve.Params().N) >= 0 {
+		return nil, errors.New("web storage contains an invalid P-256 refresh key")
+	}
+	derivedX, derivedY := curve.ScalarBaseMult(privateKey)
+	if derivedX.Cmp(publicX) != 0 || derivedY.Cmp(publicY) != 0 {
+		return nil, errors.New("web storage refresh public key does not match its private key")
+	}
+	auth.RequestCrypto.AESKey = aesKey
+	auth.RequestCrypto.HMACKey = hmacKey
+	auth.RefreshKey.KeyType = "EC"
+	auth.RefreshKey.Curve = "P-256"
+	auth.RefreshKey.D = privateKey
+	auth.RefreshKey.X = publicKey[1:33]
+	auth.RefreshKey.Y = publicKey[33:65]
+	auth.TachyonAuthToken = token
+	// localStorage does not expose the token's issue time or TTL. Mark it due
+	// now so Connect validates it through the signed refresh endpoint instead
+	// of assuming a fresh 24-hour lifetime for a potentially old disk value.
+	auth.TachyonTTL = (24 * time.Hour).Microseconds()
+	// Force libgm to prove the token and refresh key against Tachyon before the
+	// candidate can replace the durable session.
+	auth.TachyonExpiry = now.Add(-libgm.RefreshTachyonBuffer)
+	auth.DestRegID = destRegID
+	auth.PairingID = pairingID
+	return auth, nil
+}
+
+func cloneAuthData(auth *libgm.AuthData) (*libgm.AuthData, error) {
+	data, err := json.Marshal(auth)
+	if err != nil {
+		return nil, err
+	}
+	var cloned libgm.AuthData
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		return nil, err
+	}
+	return &cloned, nil
+}
+
+func validateAndRefreshWebStorageSession(auth *libgm.AuthData) error {
+	client := libgm.NewClient(auth, nil, zerolog.Nop())
+	defer client.Disconnect()
+	if err := client.Connect(); err != nil {
+		return err
+	}
+	client.Disconnect()
 	return nil
 }

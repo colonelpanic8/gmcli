@@ -53,3 +53,37 @@ func TestReadGoogleCookiesRequiresSource(t *testing.T) {
 		t.Fatalf("expected source error, got %v", err)
 	}
 }
+
+func TestReadPrivateStringMapFromStdin(t *testing.T) {
+	values, err := readPrivateStringMap("-", strings.NewReader(`{"token":"secret"}`))
+	if err != nil {
+		t.Fatalf("read private map: %v", err)
+	}
+	if values["token"] != "secret" {
+		t.Fatalf("unexpected private map: %#v", values)
+	}
+}
+
+func TestReadPrivateStringMapRejectsPermissiveFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "storage.json")
+	if err := os.WriteFile(path, []byte(`{"token":"secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readPrivateStringMap(path, strings.NewReader("")); err == nil || !strings.Contains(err.Error(), "chmod 600") {
+		t.Fatalf("expected permissions error, got %v", err)
+	}
+}
+
+func TestReadPrivateStringMapRejectsTrailingJSON(t *testing.T) {
+	_, err := readPrivateStringMap("-", strings.NewReader(`{"token":"secret"} {"other":"value"}`))
+	if err == nil || !strings.Contains(err.Error(), "decode private JSON object") {
+		t.Fatalf("expected trailing JSON error, got %v", err)
+	}
+}
+
+func TestReadPrivateStringMapRejectsEmptyObject(t *testing.T) {
+	_, err := readPrivateStringMap("-", strings.NewReader(`{}`))
+	if err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("expected empty object error, got %v", err)
+	}
+}

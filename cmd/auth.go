@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -82,7 +83,83 @@ func authCmd() *cobra.Command {
 	c.Flags().StringVar(&method, "method", "google", "pairing method: google or qr")
 	c.Flags().StringVar(&cookiesFile, "cookies-file", "", "Google cookie JSON file; use - to read from stdin (required for --method google)")
 	c.Flags().StringVar(&qrPNG, "qr-png", "", "write pairing QR code to a PNG file")
+	c.AddCommand(authRefreshWebStorageCmd())
 	return c
+}
+
+func authRefreshWebStorageCmd() *cobra.Command {
+	var input string
+	var cryptoPrefix string
+	c := &cobra.Command{
+		Use:   "refresh-web-storage",
+		Short: "Rekey an existing account session from Messages for Web localStorage",
+		Long: "Refresh a stale Google Account session from a JSON object containing the current " +
+			"Messages for Web localStorage keys. The existing browser and phone identity must match; " +
+			"the candidate is validated with Google's signed token refresh before the session file is " +
+			"replaced atomically. The session remains mode 0600.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if input == "" {
+				return errors.New("--input is required; use - to read JSON from stdin")
+			}
+			values, err := readPrivateStringMap(input, os.Stdin)
+			if err != nil {
+				return err
+			}
+			layout, err := resolveLayout()
+			if err != nil {
+				return err
+			}
+			if err := gm.RefreshSessionFromWebStorage(layout, values, cryptoPrefix); err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "Refreshed Messages session from matching web storage: %s\n", layout.Session)
+			return nil
+		},
+	}
+	c.Flags().StringVar(&input, "input", "", "JSON object of Messages localStorage values; use - for stdin")
+	c.Flags().StringVar(&cryptoPrefix, "crypto-prefix", "g_", "prefix for account-pairing encryption keys (normally g_)")
+	return c
+}
+
+func readPrivateStringMap(path string, stdin io.Reader) (map[string]string, error) {
+	const maxPrivateJSONSize = 1 << 20
+	var r io.Reader
+	if path == "-" {
+		r = stdin
+	} else {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("open private JSON file: %w", err)
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("inspect private JSON file: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("private JSON file %s is not a regular file; use --input - for a pipe", path)
+		}
+		if info.Mode().Perm()&0o077 != 0 {
+			return nil, fmt.Errorf("private JSON file %s has permissions %04o; run `chmod 600 %s` or use --input -", path, info.Mode().Perm(), path)
+		}
+		r = f
+	}
+	data, err := io.ReadAll(io.LimitReader(r, maxPrivateJSONSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read private JSON object: %w", err)
+	}
+	if len(data) > maxPrivateJSONSize {
+		return nil, fmt.Errorf("private JSON object exceeds %d bytes", maxPrivateJSONSize)
+	}
+	var values map[string]string
+	if err := json.Unmarshal(data, &values); err != nil {
+		return nil, fmt.Errorf("decode private JSON object: %w", err)
+	}
+	if len(values) == 0 {
+		return nil, errors.New("private JSON object is empty")
+	}
+	return values, nil
 }
 
 var requiredGoogleCookies = []string{"SID", "HSID", "OSID", "SSID", "APISID", "SAPISID"}

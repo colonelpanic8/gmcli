@@ -81,6 +81,7 @@ func Root() *cobra.Command {
 	root.AddCommand(contactsCmd())
 	root.AddCommand(chatsCmd())
 	root.AddCommand(historyCmd())
+	root.AddCommand(coverageCmd())
 	root.AddCommand(sendCmd())
 	root.AddCommand(mediaCmd())
 	root.AddCommand(exportCmd())

@@ -119,12 +119,18 @@ func syncCmd() *cobra.Command {
 			conversations := make(map[string]*gmproto.Conversation)
 			recentConversationIDs := make([]string, 0, 50)
 			for _, folder := range folders {
+				folderName := folder.String()
+				if err := st.StartFolderCoverage(ctx, folderName); err != nil {
+					return fmt.Errorf("start %s coverage: %w", folderName, err)
+				}
 				var cursor *gmproto.Cursor
 				serverPageSize := 0
+				folderStatus, terminalReason, folderError := store.CoveragePartial, "page_budget", ""
 				for page := 1; page <= maxConversationPages; page++ {
 					resp, err := listConversationPage(ctx, client.Underlying(), conversationLimit, folder, cursor, conversationFolderTimeout)
 					if err != nil {
 						logger.Warn().Err(err).Str("folder", folder.String()).Int("page", page).Msg("Conversation folder import stopped")
+						folderStatus, terminalReason, folderError = store.CoverageFailed, "error", err.Error()
 						break
 					}
 					pageConversations := 0
@@ -141,23 +147,38 @@ func syncCmd() *cobra.Command {
 						pageConversations++
 					}
 					logger.Info().Str("folder", folder.String()).Int("page", page).Int("conversations", pageConversations).Msg("Discovered conversation page")
+					if err := st.RecordFolderCoveragePage(ctx, folderName, pageConversations); err != nil {
+						return fmt.Errorf("record %s coverage page: %w", folderName, err)
+					}
 					if page == 1 {
 						serverPageSize = pageConversations
 					} else if pageConversations < serverPageSize {
 						// Google still returns a cursor on the final, short page.
+						folderStatus, terminalReason = store.CoverageComplete, "short_page"
 						break
 					}
 					next := resp.GetCursor()
 					if next == nil {
 						if len(resp.GetCursorBytes()) > 0 {
 							logger.Warn().Str("folder", folder.String()).Msg("Conversation response has an opaque cursor that this protocol version cannot continue")
+							folderStatus, terminalReason = store.CoveragePartial, "opaque_cursor"
+						} else {
+							folderStatus, terminalReason = store.CoverageComplete, "no_cursor"
 						}
 						break
 					}
-					if pageConversations == 0 || sameCursor(cursor, next) {
+					if pageConversations == 0 {
+						folderStatus, terminalReason = store.CoverageComplete, "empty_page"
+						break
+					}
+					if sameCursor(cursor, next) {
+						folderStatus, terminalReason = store.CoveragePartial, "same_cursor"
 						break
 					}
 					cursor = next
+				}
+				if err := st.FinishFolderCoverage(ctx, folderName, folderStatus, terminalReason, folderError); err != nil {
+					return fmt.Errorf("finish %s coverage: %w", folderName, err)
 				}
 			}
 			msgs := 0

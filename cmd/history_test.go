@@ -2,8 +2,11 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
 
 func TestHistoryBackfillResultJSONIsUnambiguous(t *testing.T) {
@@ -37,5 +40,33 @@ func TestHistoryBackfillResultJSONIsUnambiguous(t *testing.T) {
 	}
 	if strings.Contains(out, `"imported"`) {
 		t.Fatalf("json should not expose ambiguous imported field: %s", out)
+	}
+}
+
+func TestHistoryPageBoundsOverlapCursorBoundary(t *testing.T) {
+	messages := []*gmproto.Message{{Timestamp: 1_000}, {Timestamp: 900}, {Timestamp: 950}}
+	start, end := historyPageBounds(messages, &gmproto.Cursor{LastItemTimestamp: 1_100})
+	if start != 900 || end != 1_101 {
+		t.Fatalf("bounds = [%d,%d), want [900,1101)", start, end)
+	}
+}
+
+func TestTerminalSessionErrorsStopResumableBackfill(t *testing.T) {
+	for _, message := range []string{
+		"fetch messages: HTTP 401: invalid authentication credentials",
+		"SESSION_COOKIE_INVALID",
+		"session expired while polling",
+	} {
+		if !isTerminalSessionError(errors.New(message)) {
+			t.Errorf("expected terminal session error for %q", message)
+		}
+	}
+	for _, message := range []string{
+		"fetch messages: context deadline exceeded",
+		"temporary relay failure",
+	} {
+		if isTerminalSessionError(errors.New(message)) {
+			t.Errorf("unexpected terminal session error for %q", message)
+		}
 	}
 }

@@ -304,7 +304,7 @@ func TestExportJSONL(t *testing.T) {
 	if err := json.Unmarshal([]byte(resultJSON), &result); err != nil {
 		t.Fatalf("result json: %v\n%s", err, resultJSON)
 	}
-	if result.Format != "gmcli-jsonl-archive" || result.FormatVersion != 2 || result.Conversations != 2 || result.Messages != 5 || result.Contacts != 3 {
+	if result.Format != "gmcli-jsonl-archive" || result.FormatVersion != 3 || result.Conversations != 2 || result.Messages != 5 || result.Contacts != 3 {
 		t.Fatalf("unexpected result: %+v", result)
 	}
 
@@ -372,7 +372,7 @@ func TestExportJSONL(t *testing.T) {
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		t.Fatalf("manifest json: %v", err)
 	}
-	if manifest.Format != result.Format || manifest.FormatVersion != 2 || len(manifest.ConversationMessages) != result.Conversations {
+	if manifest.Format != result.Format || manifest.FormatVersion != 3 || len(manifest.ConversationMessages) != result.Conversations {
 		t.Fatalf("unexpected manifest: %+v", manifest)
 	}
 	validateFile(manifest.Files["conversations"].Path, manifest.Files["conversations"].Records, manifest.Files["conversations"].SHA256, "")
@@ -399,6 +399,24 @@ func TestExportJSONL(t *testing.T) {
 				}
 			}
 		}
+	}
+	coverageFile := manifest.Files["coverage"]
+	coverageData, err := os.ReadFile(filepath.Join(out, coverageFile.Path))
+	if err != nil {
+		t.Fatalf("read coverage lookup: %v", err)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(coverageData)); got != coverageFile.SHA256 {
+		t.Fatalf("coverage checksum = %s, want %s", got, coverageFile.SHA256)
+	}
+	var coverage struct {
+		Version       int                        `json:"version"`
+		Conversations map[string]json.RawMessage `json:"conversations"`
+	}
+	if err := json.Unmarshal(coverageData, &coverage); err != nil {
+		t.Fatalf("decode coverage lookup: %v", err)
+	}
+	if coverage.Version != 1 || len(coverage.Conversations) != result.Conversations {
+		t.Fatalf("unexpected coverage lookup: version=%d conversations=%d", coverage.Version, len(coverage.Conversations))
 	}
 	totalMessages := 0
 	for _, file := range manifest.ConversationMessages {

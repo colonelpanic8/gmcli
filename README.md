@@ -151,7 +151,8 @@ gmcli --json chats list | jq '.[0].name'
 
 For a streamable backup, export the archive as segmented JSONL. The output
 directory contains `conversations.jsonl`, keyed `contacts.json` and
-`aliases.json` lookup objects, one `messages/*.jsonl` file per conversation,
+`aliases.json` lookup objects, per-folder and per-conversation `coverage.json`,
+one `messages/*.jsonl` file per conversation,
 and a manifest mapping each conversation ID to its file, record count, and
 SHA-256 checksum. Contact and alias identities appear only as lookup keys, not
 redundantly in every message. The directory and files use private permissions:
@@ -159,7 +160,17 @@ redundantly in every message. The directory and files use private permissions:
 ```sh
 gmcli export jsonl --out ~/Backups/gmcli/latest --force
 gmcli export verify --dir ~/Backups/gmcli/latest
+gmcli coverage
+gmcli --json coverage --conversation <conv-id>
 ```
+
+Coverage is evidence-based and is never inferred from message counts. Each
+successful history page immediately records a per-conversation half-open time
+segment; an empty terminal page records that Google reported the beginning of
+that conversation's available history. Request budgets, repeated/missing
+cursors, authentication failures, and folder timeouts remain explicitly
+partial or failed. Archives created before coverage tracking therefore migrate
+as `not_attempted` until those conversations are traversed again.
 
 ## Global flags
 

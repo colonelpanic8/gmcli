@@ -1,7 +1,7 @@
 package store
 
 // schemaVersion is the migration target. Bump when migrations[] grows.
-const schemaVersion = 3
+const schemaVersion = 4
 
 // migrations are applied in order. Each runs in its own transaction; the
 // store records the highest applied version in the schema_version table.
@@ -141,5 +141,49 @@ var migrations = []string{
 	) STRICT;
 
 	INSERT INTO schema_version (version) VALUES (3);
+	`,
+	// v4: durable synchronization coverage. Message history is scoped per
+	// conversation; folder discovery is tracked separately because completing
+	// Inbox enumeration says nothing about Archive or Spam & blocked.
+	`
+	CREATE TABLE conversation_coverage (
+		conversation_id      TEXT PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+		status               TEXT NOT NULL CHECK (status IN ('not_attempted','in_progress','partial','source_exhausted','failed')),
+		history_start_ms     INTEGER,
+		last_attempt_ts      INTEGER NOT NULL DEFAULT 0,
+		last_success_ts      INTEGER NOT NULL DEFAULT 0,
+		exhausted_at         INTEGER NOT NULL DEFAULT 0,
+		terminal_reason      TEXT NOT NULL DEFAULT '',
+		last_error           TEXT NOT NULL DEFAULT '',
+		last_requests        INTEGER NOT NULL DEFAULT 0,
+		last_records_fetched INTEGER NOT NULL DEFAULT 0,
+		updated_at           INTEGER NOT NULL
+	) STRICT;
+
+	CREATE TABLE conversation_coverage_segments (
+		conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+		start_ms        INTEGER NOT NULL,
+		end_ms          INTEGER NOT NULL,
+		verified_at     INTEGER NOT NULL,
+		PRIMARY KEY (conversation_id, start_ms, end_ms),
+		CHECK (start_ms < end_ms)
+	) STRICT;
+
+	CREATE INDEX ix_conversation_coverage_segments
+		ON conversation_coverage_segments (conversation_id, start_ms, end_ms);
+
+	CREATE TABLE folder_coverage (
+		folder             TEXT PRIMARY KEY,
+		status             TEXT NOT NULL CHECK (status IN ('not_attempted','in_progress','partial','complete','failed')),
+		pages_fetched      INTEGER NOT NULL DEFAULT 0,
+		conversations_seen INTEGER NOT NULL DEFAULT 0,
+		last_attempt_ts    INTEGER NOT NULL DEFAULT 0,
+		last_success_ts    INTEGER NOT NULL DEFAULT 0,
+		terminal_reason    TEXT NOT NULL DEFAULT '',
+		last_error         TEXT NOT NULL DEFAULT '',
+		updated_at         INTEGER NOT NULL
+	) STRICT;
+
+	INSERT INTO schema_version (version) VALUES (4);
 	`,
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
@@ -23,6 +24,10 @@ type historyBackfillResult struct {
 	MessagesBefore       int    `json:"messages_before"`
 	MessagesAfter        int    `json:"messages_after"`
 	MessagesAddedForChat int    `json:"messages_added_for_chat"`
+	Exhausted            bool   `json:"exhausted"`
+	RequestLimitReached  bool   `json:"request_limit_reached"`
+	CoverageStatus       string `json:"coverage_status"`
+	TerminalReason       string `json:"terminal_reason"`
 }
 
 type historyBackfillError struct {
@@ -32,8 +37,13 @@ type historyBackfillError struct {
 
 type historyBackfillAllResult struct {
 	Conversations   int                     `json:"conversations"`
+	Offset          int                     `json:"offset"`
+	Attempted       int                     `json:"attempted"`
+	NextOffset      int                     `json:"next_offset"`
 	Completed       int                     `json:"completed"`
 	Failed          int                     `json:"failed"`
+	Exhausted       int                     `json:"exhausted"`
+	NeedsMore       int                     `json:"needs_more"`
 	FetchedMessages int                     `json:"fetched_messages"`
 	MessagesAdded   int                     `json:"messages_added"`
 	Results         []historyBackfillResult `json:"results"`
@@ -55,6 +65,8 @@ func historyCmd() *cobra.Command {
 func historyBackfillAllCmd() *cobra.Command {
 	var requests int
 	var count int64
+	var offset int
+	var limit int
 	c := &cobra.Command{
 		Use:   "backfill-all",
 		Short: "Fetch older messages for every locally known conversation",
@@ -67,20 +79,22 @@ func historyBackfillAllCmd() *cobra.Command {
 			if count <= 0 {
 				count = 50
 			}
-			res, err := runHistoryBackfillAll(requests, count)
-			if err != nil {
-				return err
-			}
+			res, err := runHistoryBackfillAll(requests, count, offset, limit)
 			if flags.jsonOut {
-				return output.JSON(os.Stdout, res)
+				if outputErr := output.JSON(os.Stdout, res); outputErr != nil {
+					return outputErr
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "Backfilled %d/%d attempted conversation(s): fetched %d message record(s), added %d local message(s); %d exhausted, %d need more, %d failed; next offset %d\n",
+					res.Completed, res.Attempted, res.FetchedMessages, res.MessagesAdded, res.Exhausted, res.NeedsMore, res.Failed, res.NextOffset)
 			}
-			fmt.Fprintf(os.Stderr, "Backfilled %d/%d conversation(s): fetched %d message record(s), added %d local message(s); %d failed\n",
-				res.Completed, res.Conversations, res.FetchedMessages, res.MessagesAdded, res.Failed)
-			return nil
+			return err
 		},
 	}
 	c.Flags().IntVar(&requests, "requests", 10, "max FetchMessages calls to make per conversation")
 	c.Flags().Int64Var(&count, "count", 50, "max message records to request per FetchMessages call")
+	c.Flags().IntVar(&offset, "offset", 0, "skip this many locally known conversations (for resumable runs)")
+	c.Flags().IntVar(&limit, "limit", 0, "process at most this many conversations after --offset (0 means all)")
 	return c
 }
 
@@ -154,7 +168,7 @@ func runHistoryBackfill(chat string, requests int, count int64) (historyBackfill
 	return runHistoryBackfillConnected(ctx, st, client, pump, chat, requests, count)
 }
 
-func runHistoryBackfillAll(requests int, count int64) (historyBackfillAllResult, error) {
+func runHistoryBackfillAll(requests int, count int64, offset, limit int) (historyBackfillAllResult, error) {
 	layout, err := resolveLayout()
 	if err != nil {
 		return historyBackfillAllResult{}, err
@@ -177,11 +191,24 @@ func runHistoryBackfillAll(requests int, count int64) (historyBackfillAllResult,
 	if err != nil {
 		return historyBackfillAllResult{}, err
 	}
+	if offset < 0 {
+		return historyBackfillAllResult{}, fmt.Errorf("offset must be non-negative")
+	}
+	if offset > len(conversations) {
+		offset = len(conversations)
+	}
+	selected := conversations[offset:]
+	if limit > 0 && limit < len(selected) {
+		selected = selected[:limit]
+	}
 	result := historyBackfillAllResult{
 		Conversations: len(conversations),
-		Results:       make([]historyBackfillResult, 0, len(conversations)),
+		Offset:        offset,
+		Attempted:     len(selected),
+		NextOffset:    offset,
+		Results:       make([]historyBackfillResult, 0, len(selected)),
 	}
-	if len(conversations) == 0 {
+	if len(selected) == 0 {
 		return result, nil
 	}
 
@@ -196,19 +223,34 @@ func runHistoryBackfillAll(requests int, count int64) (historyBackfillAllResult,
 	}
 	defer client.Disconnect()
 
-	for i, conversation := range conversations {
-		fmt.Fprintf(os.Stderr, "Backfilling conversation %d/%d (%s)\n", i+1, len(conversations), conversation.ID)
+	for i, conversation := range selected {
+		absoluteIndex := offset + i
+		fmt.Fprintf(os.Stderr, "Backfilling conversation %d/%d (%s)\n", absoluteIndex+1, len(conversations), conversation.ID)
 		res, err := runHistoryBackfillConnected(ctx, st, client, pump, conversation.ID, requests, count)
 		if err != nil {
 			result.Failed++
 			result.Errors = append(result.Errors, historyBackfillError{ConversationID: conversation.ID, Error: err.Error()})
 			fmt.Fprintf(os.Stderr, "Backfill failed for %s: %v\n", conversation.ID, err)
+			if isTerminalSessionError(err) {
+				result.NextOffset = absoluteIndex
+				return result, fmt.Errorf("session expired at conversation offset %d; re-pair and resume with --offset %d: %w", absoluteIndex, absoluteIndex, err)
+			}
+			result.NextOffset = absoluteIndex + 1
 			continue
 		}
 		result.Completed++
+		if res.Exhausted {
+			result.Exhausted++
+		} else {
+			result.NeedsMore++
+		}
 		result.FetchedMessages += res.FetchedMessages
 		result.MessagesAdded += res.MessagesAddedForChat
 		result.Results = append(result.Results, res)
+		result.NextOffset = absoluteIndex + 1
+	}
+	if result.Failed > 0 || result.NeedsMore > 0 {
+		return result, fmt.Errorf("history backfill incomplete: %d conversation(s) failed and %d reached the request limit before exhaustion", result.Failed, result.NeedsMore)
 	}
 	return result, nil
 }
@@ -222,6 +264,9 @@ func runHistoryBackfillConnected(ctx context.Context, st *store.Store, client *g
 		}
 		return historyBackfillResult{}, fmt.Errorf("conversation %s is not in the local store; run `gmcli sync` first", chat)
 	}
+	if err := st.StartConversationCoverage(ctx, chat); err != nil {
+		return historyBackfillResult{}, fmt.Errorf("start coverage: %w", err)
+	}
 
 	cursor, err := oldestCursor(ctx, st, chat)
 	if err != nil {
@@ -233,10 +278,13 @@ func runHistoryBackfillConnected(ctx context.Context, st *store.Store, client *g
 		return historyBackfillResult{}, fmt.Errorf("count messages before backfill: %w", err)
 	}
 
-	res := historyBackfillResult{ConversationID: chat, Count: count, MessagesBefore: before}
+	res := historyBackfillResult{ConversationID: chat, Count: count, MessagesBefore: before, CoverageStatus: store.CoverageInProgress}
 	for i := 0; i < requests; i++ {
+		requestCursor := cursor
 		resp, err := client.Underlying().FetchMessages(chat, count, cursor)
 		if err != nil {
+			res.CoverageStatus, res.TerminalReason = store.CoverageFailed, "error"
+			_ = st.FinishConversationCoverage(ctx, chat, res.CoverageStatus, res.TerminalReason, nil, res.Requests, res.FetchedMessages, err.Error())
 			return res, fmt.Errorf("fetch messages: %w", err)
 		}
 		res.Requests++
@@ -245,11 +293,53 @@ func runHistoryBackfillConnected(ctx context.Context, st *store.Store, client *g
 		imported := pump.ImportMessages(ctx, msgs)
 		res.SyncRecordsProcessed += imported
 		next := resp.GetCursor()
-		if len(msgs) == 0 || sameCursor(cursor, next) {
+		if len(msgs) == 0 {
+			historyStart := int64(0)
+			if requestCursor != nil {
+				historyStart = normalizeHistoryTimestampMS(requestCursor.GetLastItemTimestamp())
+				if historyStart > 0 {
+					if err := st.RecordConversationCoveragePage(ctx, chat, 0, historyStart+1, res.Requests, res.FetchedMessages); err != nil {
+						return res, fmt.Errorf("record exhausted coverage: %w", err)
+					}
+				}
+			}
+			res.CoverageStatus, res.TerminalReason = store.CoverageSourceExhausted, "empty_page"
+			res.Exhausted = true
+			if err := st.FinishConversationCoverage(ctx, chat, res.CoverageStatus, res.TerminalReason, &historyStart, res.Requests, res.FetchedMessages, ""); err != nil {
+				return res, fmt.Errorf("finish exhausted coverage: %w", err)
+			}
+			break
+		}
+		startMS, endMS := historyPageBounds(msgs, requestCursor)
+		if startMS < endMS {
+			if err := st.RecordConversationCoveragePage(ctx, chat, startMS, endMS, res.Requests, res.FetchedMessages); err != nil {
+				return res, fmt.Errorf("record coverage page: %w", err)
+			}
+		}
+		if sameCursor(cursor, next) {
+			res.CoverageStatus, res.TerminalReason = store.CoveragePartial, "same_cursor"
+			if err := st.FinishConversationCoverage(ctx, chat, res.CoverageStatus, res.TerminalReason, nil, res.Requests, res.FetchedMessages, ""); err != nil {
+				return res, err
+			}
+			break
+		}
+		if next == nil {
+			res.CoverageStatus, res.TerminalReason = store.CoveragePartial, "missing_cursor"
+			if err := st.FinishConversationCoverage(ctx, chat, res.CoverageStatus, res.TerminalReason, nil, res.Requests, res.FetchedMessages, ""); err != nil {
+				return res, err
+			}
 			break
 		}
 		cursor = next
 	}
+	if res.CoverageStatus == store.CoverageInProgress {
+		res.CoverageStatus, res.TerminalReason = store.CoveragePartial, "request_budget"
+		res.RequestLimitReached = true
+		if err := st.FinishConversationCoverage(ctx, chat, res.CoverageStatus, res.TerminalReason, nil, res.Requests, res.FetchedMessages, ""); err != nil {
+			return res, err
+		}
+	}
+	res.Exhausted = res.CoverageStatus == store.CoverageSourceExhausted
 	after, err := st.CountMessagesForConversation(ctx, chat)
 	if err != nil {
 		return res, fmt.Errorf("count messages after backfill: %w", err)
@@ -257,6 +347,54 @@ func runHistoryBackfillConnected(ctx context.Context, st *store.Store, client *g
 	res.MessagesAfter = after
 	res.MessagesAddedForChat = after - before
 	return res, nil
+}
+
+func historyPageBounds(messages []*gmproto.Message, cursor *gmproto.Cursor) (int64, int64) {
+	var oldest, newest int64
+	for _, message := range messages {
+		if message == nil {
+			continue
+		}
+		ts := normalizeHistoryTimestampMS(message.GetTimestamp())
+		if ts <= 0 {
+			continue
+		}
+		if oldest == 0 || ts < oldest {
+			oldest = ts
+		}
+		if ts > newest {
+			newest = ts
+		}
+	}
+	if oldest == 0 {
+		return 0, 0
+	}
+	end := newest + 1
+	if cursor != nil {
+		cursorEnd := normalizeHistoryTimestampMS(cursor.GetLastItemTimestamp()) + 1
+		if cursorEnd > end {
+			end = cursorEnd
+		}
+	}
+	return oldest, end
+}
+
+func normalizeHistoryTimestampMS(ts int64) int64 {
+	if ts > 100_000_000_000_000 {
+		return ts / 1000
+	}
+	return ts
+}
+
+func isTerminalSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "session_cookie_invalid") ||
+		strings.Contains(message, "invalid authentication credentials") ||
+		strings.Contains(message, "http 401") ||
+		strings.Contains(message, "session expired")
 }
 
 func oldestCursor(ctx context.Context, st *store.Store, chat string) (*gmproto.Cursor, error) {

@@ -39,7 +39,7 @@ type jsonlConversationFile struct {
 	SHA256         string `json:"sha256"`
 }
 
-const jsonlFormatVersion = 2
+const jsonlFormatVersion = 3
 
 type contactLookupValue struct {
 	SourcePlatform  string `json:"source_platform"`
@@ -56,6 +56,35 @@ type aliasLookupValue struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+type coverageLookup struct {
+	Version       int                                   `json:"version"`
+	Folders       map[string]coverageFolderLookup       `json:"folders"`
+	Conversations map[string]coverageConversationLookup `json:"conversations"`
+}
+
+type coverageFolderLookup struct {
+	Status            string     `json:"status"`
+	PagesFetched      int        `json:"pages_fetched"`
+	ConversationsSeen int        `json:"conversations_seen"`
+	LastAttemptAt     *time.Time `json:"last_attempt_at,omitempty"`
+	LastSuccessAt     *time.Time `json:"last_success_at,omitempty"`
+	TerminalReason    string     `json:"terminal_reason,omitempty"`
+	LastError         string     `json:"last_error,omitempty"`
+}
+
+type coverageConversationLookup struct {
+	Status             string                  `json:"status"`
+	HistoryStartMS     *int64                  `json:"history_start_ms,omitempty"`
+	LastAttemptAt      *time.Time              `json:"last_attempt_at,omitempty"`
+	LastSuccessAt      *time.Time              `json:"last_success_at,omitempty"`
+	ExhaustedAt        *time.Time              `json:"exhausted_at,omitempty"`
+	TerminalReason     string                  `json:"terminal_reason,omitempty"`
+	LastError          string                  `json:"last_error,omitempty"`
+	LastRequests       int                     `json:"last_requests"`
+	LastRecordsFetched int                     `json:"last_records_fetched"`
+	Segments           []store.CoverageSegment `json:"segments"`
+}
+
 // VerifyResult describes a successfully verified JSONL archive.
 type VerifyResult struct {
 	Path          string `json:"path"`
@@ -68,10 +97,10 @@ type VerifyResult struct {
 	Aliases       int    `json:"aliases"`
 }
 
-// WriteJSONL writes a consistent snapshot as one JSON object per line,
-// segmented by record type. A manifest.json records format metadata and row
-// counts. The destination directory is installed only after every file has
-// been written and synced successfully.
+// WriteJSONL writes a consistent segmented snapshot. Conversations and
+// messages are JSONL; small keyed metadata tables are deterministic JSON
+// objects. A manifest records format metadata, row counts, and checksums. The
+// destination is installed only after every file has been synced successfully.
 func WriteJSONL(ctx context.Context, st *store.Store, path string, force bool) (Result, error) {
 	if path == "" {
 		return Result{}, fmt.Errorf("output directory is required")
@@ -148,6 +177,10 @@ func writeJSONLSnapshot(ctx context.Context, st *store.Store, dir string) (Resul
 		return Result{}, jsonlManifest{}, err
 	}
 	result.Aliases = aliasFile.Records
+	coverageFile, err := writeCoverageLookup(ctx, tx, filepath.Join(dir, "coverage.json"))
+	if err != nil {
+		return Result{}, jsonlManifest{}, err
+	}
 
 	conversationIDs, err := listConversationIDs(ctx, tx)
 	if err != nil {
@@ -191,10 +224,106 @@ func writeJSONLSnapshot(ctx context.Context, st *store.Store, dir string) (Resul
 			"conversations": {Path: "conversations.jsonl", Records: conversationFile.Records, SHA256: conversationFile.SHA256},
 			"contacts":      {Path: "contacts.json", Records: contactFile.Records, SHA256: contactFile.SHA256},
 			"aliases":       {Path: "aliases.json", Records: aliasFile.Records, SHA256: aliasFile.SHA256},
+			"coverage":      {Path: "coverage.json", Records: coverageFile.Records, SHA256: coverageFile.SHA256},
 		},
 		ConversationMessages: conversationFiles,
 	}
 	return result, manifest, nil
+}
+
+func writeCoverageLookup(ctx context.Context, tx *sql.Tx, path string) (jsonlFile, error) {
+	value := coverageLookup{Version: 1, Folders: make(map[string]coverageFolderLookup), Conversations: make(map[string]coverageConversationLookup)}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT c.conversation_id, COALESCE(cc.status, 'not_attempted'), cc.history_start_ms,
+		       COALESCE(cc.last_attempt_ts, 0), COALESCE(cc.last_success_ts, 0),
+		       COALESCE(cc.exhausted_at, 0), COALESCE(cc.terminal_reason, ''),
+		       COALESCE(cc.last_error, ''), COALESCE(cc.last_requests, 0),
+		       COALESCE(cc.last_records_fetched, 0)
+		  FROM conversations c LEFT JOIN conversation_coverage cc USING (conversation_id)
+		 ORDER BY c.conversation_id`)
+	if err != nil {
+		return jsonlFile{}, fmt.Errorf("query coverage.json conversations: %w", err)
+	}
+	for rows.Next() {
+		var id, status, reason, lastError string
+		var history sql.NullInt64
+		var attempted, success, exhausted int64
+		var requests, fetched int
+		if err := rows.Scan(&id, &status, &history, &attempted, &success, &exhausted, &reason, &lastError, &requests, &fetched); err != nil {
+			rows.Close()
+			return jsonlFile{}, err
+		}
+		entry := coverageConversationLookup{Status: status, LastAttemptAt: archiveMillisTimePtr(attempted), LastSuccessAt: archiveMillisTimePtr(success), ExhaustedAt: archiveMillisTimePtr(exhausted), TerminalReason: reason, LastError: lastError, LastRequests: requests, LastRecordsFetched: fetched, Segments: []store.CoverageSegment{}}
+		if history.Valid {
+			v := history.Int64
+			entry.HistoryStartMS = &v
+		}
+		value.Conversations[id] = entry
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return jsonlFile{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return jsonlFile{}, err
+	}
+	rows, err = tx.QueryContext(ctx, `SELECT conversation_id, start_ms, end_ms, verified_at FROM conversation_coverage_segments ORDER BY conversation_id, start_ms`)
+	if err != nil {
+		return jsonlFile{}, err
+	}
+	for rows.Next() {
+		var id string
+		var segment store.CoverageSegment
+		var verified int64
+		if err := rows.Scan(&id, &segment.StartMS, &segment.EndMS, &verified); err != nil {
+			rows.Close()
+			return jsonlFile{}, err
+		}
+		segment.VerifiedAt = archiveMillisTime(verified)
+		entry := value.Conversations[id]
+		entry.Segments = append(entry.Segments, segment)
+		value.Conversations[id] = entry
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return jsonlFile{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return jsonlFile{}, err
+	}
+	rows, err = tx.QueryContext(ctx, `SELECT folder, status, pages_fetched, conversations_seen, last_attempt_ts, last_success_ts, terminal_reason, last_error FROM folder_coverage ORDER BY folder`)
+	if err != nil {
+		return jsonlFile{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var folder, status, reason, lastError string
+		var pages, seen int
+		var attempted, success int64
+		if err := rows.Scan(&folder, &status, &pages, &seen, &attempted, &success, &reason, &lastError); err != nil {
+			return jsonlFile{}, err
+		}
+		value.Folders[folder] = coverageFolderLookup{Status: status, PagesFetched: pages, ConversationsSeen: seen, LastAttemptAt: archiveMillisTimePtr(attempted), LastSuccessAt: archiveMillisTimePtr(success), TerminalReason: reason, LastError: lastError}
+	}
+	if err := rows.Err(); err != nil {
+		return jsonlFile{}, err
+	}
+	return writeLookupFile(path, value, len(value.Conversations))
+}
+
+func archiveMillisTime(value int64) time.Time {
+	if value <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(value).UTC()
+}
+
+func archiveMillisTimePtr(value int64) *time.Time {
+	if value <= 0 {
+		return nil
+	}
+	t := time.UnixMilli(value).UTC()
+	return &t
 }
 
 func writeContactLookup(ctx context.Context, tx *sql.Tx, path string) (jsonlFile, error) {
@@ -413,7 +542,7 @@ func VerifyJSONL(path string) (VerifyResult, error) {
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		return VerifyResult{}, fmt.Errorf("decode manifest: %w", err)
 	}
-	if manifest.Format != "gmcli-jsonl-archive" || (manifest.FormatVersion != 1 && manifest.FormatVersion != jsonlFormatVersion) {
+	if manifest.Format != "gmcli-jsonl-archive" || manifest.FormatVersion < 1 || manifest.FormatVersion > jsonlFormatVersion {
 		return VerifyResult{}, fmt.Errorf("unsupported archive format %q version %d", manifest.Format, manifest.FormatVersion)
 	}
 	result := VerifyResult{
@@ -423,7 +552,11 @@ func VerifyJSONL(path string) (VerifyResult, error) {
 		SchemaVersion: manifest.SchemaVersion,
 	}
 	required := []string{"conversations", "contacts", "aliases"}
+	if manifest.FormatVersion >= 3 {
+		required = append(required, "coverage")
+	}
 	tablePaths := make(map[string]struct{}, len(required))
+	var coverageIDs map[string]struct{}
 	for _, name := range required {
 		file, ok := manifest.Files[name]
 		if !ok {
@@ -431,6 +564,12 @@ func VerifyJSONL(path string) (VerifyResult, error) {
 		}
 		if manifest.FormatVersion == 1 || name == "conversations" {
 			if err := verifyJSONLFile(abs, file.Path, file.Records, file.SHA256, ""); err != nil {
+				return VerifyResult{}, err
+			}
+		} else if name == "coverage" {
+			var err error
+			coverageIDs, err = verifyCoverageFile(abs, file.Path, file.Records, file.SHA256)
+			if err != nil {
 				return VerifyResult{}, err
 			}
 		} else if err := verifyLookupFile(abs, file.Path, file.Records, file.SHA256, name == "aliases"); err != nil {
@@ -460,6 +599,13 @@ func VerifyJSONL(path string) (VerifyResult, error) {
 	if len(conversationIDs) != result.Conversations {
 		return VerifyResult{}, fmt.Errorf("conversation file contains %d unique IDs, want %d", len(conversationIDs), result.Conversations)
 	}
+	if manifest.FormatVersion >= 3 {
+		for id := range conversationIDs {
+			if _, ok := coverageIDs[id]; !ok {
+				return VerifyResult{}, fmt.Errorf("coverage file is missing conversation ID %q", id)
+			}
+		}
+	}
 	seenIDs := make(map[string]struct{}, len(manifest.ConversationMessages))
 	seenPaths := make(map[string]struct{}, len(manifest.ConversationMessages))
 	for _, file := range manifest.ConversationMessages {
@@ -486,6 +632,50 @@ func VerifyJSONL(path string) (VerifyResult, error) {
 		result.Messages += file.Messages
 	}
 	return result, nil
+}
+
+func verifyCoverageFile(root, relativePath string, wantRecords int, wantSHA string) (map[string]struct{}, error) {
+	path, err := safeArchivePath(root, relativePath)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s: %w", relativePath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("archive path %s is not a regular file", relativePath)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", relativePath, err)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(data)); got != wantSHA {
+		return nil, fmt.Errorf("%s SHA-256 mismatch: got %s, want %s", relativePath, got, wantSHA)
+	}
+	var value coverageLookup
+	if err := json.Unmarshal(data, &value); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", relativePath, err)
+	}
+	if value.Version != 1 {
+		return nil, fmt.Errorf("unsupported coverage format version %d", value.Version)
+	}
+	if len(value.Conversations) != wantRecords {
+		return nil, fmt.Errorf("%s contains %d conversation records, manifest says %d", relativePath, len(value.Conversations), wantRecords)
+	}
+	ids := make(map[string]struct{}, len(value.Conversations))
+	for id, conversation := range value.Conversations {
+		if id == "" {
+			return nil, fmt.Errorf("%s contains an empty conversation key", relativePath)
+		}
+		ids[id] = struct{}{}
+		for _, segment := range conversation.Segments {
+			if segment.StartMS >= segment.EndMS {
+				return nil, fmt.Errorf("%s conversation %s has invalid segment [%d,%d)", relativePath, id, segment.StartMS, segment.EndMS)
+			}
+		}
+	}
+	return ids, nil
 }
 
 func verifyLookupFile(root, relativePath string, wantRecords int, wantSHA string, nested bool) error {

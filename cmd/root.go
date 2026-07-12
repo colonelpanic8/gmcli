@@ -85,6 +85,7 @@ func Root() *cobra.Command {
 	root.AddCommand(sendCmd())
 	root.AddCommand(mediaCmd())
 	root.AddCommand(exportCmd())
+	root.AddCommand(androidCmd())
 	return root
 }
 

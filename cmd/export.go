@@ -52,9 +52,9 @@ func exportJSONLCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "jsonl",
 		Short: "Export a segmented, line-oriented archive directory",
-		Long: "Writes conversations.jsonl, contacts.jsonl, aliases.jsonl, one messages/*.jsonl " +
+		Long: "Writes conversations.jsonl, keyed contacts.json and aliases.json lookups, one messages/*.jsonl " +
 			"file per conversation, and a checksummed manifest.json into one private directory. " +
-			"Each JSONL line is an independent JSON object.",
+			"Each conversation and message JSONL line is an independent JSON object.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if out == "" {
 				return fmt.Errorf("--out is required")
@@ -71,7 +71,7 @@ func exportJSONLCmd() *cobra.Command {
 			if flags.jsonOut {
 				return output.JSON(os.Stdout, result)
 			}
-			fmt.Fprintf(os.Stderr, "Exported %d conversations, %d messages, %d contacts, and %d aliases as JSONL to %s\n",
+			fmt.Fprintf(os.Stderr, "Exported %d conversations, %d messages, %d contacts, and %d aliases as a segmented archive to %s\n",
 				result.Conversations, result.Messages, result.Contacts, result.Aliases, result.Path)
 			return nil
 		},

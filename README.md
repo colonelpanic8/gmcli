@@ -150,10 +150,11 @@ gmcli --json chats list | jq '.[0].name'
 ```
 
 For a streamable backup, export the archive as segmented JSONL. The output
-directory contains `conversations.jsonl`, `contacts.jsonl`, `aliases.jsonl`,
-one `messages/*.jsonl` file per conversation, and a manifest mapping each
-conversation ID to its file, record count, and SHA-256 checksum. The directory
-and files use private permissions:
+directory contains `conversations.jsonl`, keyed `contacts.json` and
+`aliases.json` lookup objects, one `messages/*.jsonl` file per conversation,
+and a manifest mapping each conversation ID to its file, record count, and
+SHA-256 checksum. Contact and alias identities appear only as lookup keys, not
+redundantly in every message. The directory and files use private permissions:
 
 ```sh
 gmcli export jsonl --out ~/Backups/gmcli/latest --force

@@ -295,6 +295,7 @@ func TestExportJSONL(t *testing.T) {
 
 	var result struct {
 		Format        string `json:"format"`
+		FormatVersion int    `json:"format_version"`
 		Conversations int    `json:"conversations"`
 		Messages      int    `json:"messages"`
 		Contacts      int    `json:"contacts"`
@@ -303,7 +304,7 @@ func TestExportJSONL(t *testing.T) {
 	if err := json.Unmarshal([]byte(resultJSON), &result); err != nil {
 		t.Fatalf("result json: %v\n%s", err, resultJSON)
 	}
-	if result.Format != "gmcli-jsonl-archive" || result.Conversations != 2 || result.Messages != 5 || result.Contacts != 3 {
+	if result.Format != "gmcli-jsonl-archive" || result.FormatVersion != 2 || result.Conversations != 2 || result.Messages != 5 || result.Contacts != 3 {
 		t.Fatalf("unexpected result: %+v", result)
 	}
 
@@ -354,8 +355,9 @@ func TestExportJSONL(t *testing.T) {
 		t.Fatalf("read manifest: %v", err)
 	}
 	var manifest struct {
-		Format string `json:"format"`
-		Files  map[string]struct {
+		Format        string `json:"format"`
+		FormatVersion int    `json:"format_version"`
+		Files         map[string]struct {
 			Path    string `json:"path"`
 			Records int    `json:"records"`
 			SHA256  string `json:"sha256"`
@@ -370,12 +372,33 @@ func TestExportJSONL(t *testing.T) {
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		t.Fatalf("manifest json: %v", err)
 	}
-	if manifest.Format != result.Format || len(manifest.ConversationMessages) != result.Conversations {
+	if manifest.Format != result.Format || manifest.FormatVersion != 2 || len(manifest.ConversationMessages) != result.Conversations {
 		t.Fatalf("unexpected manifest: %+v", manifest)
 	}
-	for _, name := range []string{"conversations", "contacts", "aliases"} {
+	validateFile(manifest.Files["conversations"].Path, manifest.Files["conversations"].Records, manifest.Files["conversations"].SHA256, "")
+	for _, name := range []string{"contacts", "aliases"} {
 		file := manifest.Files[name]
-		validateFile(file.Path, file.Records, file.SHA256, "")
+		data, err := os.ReadFile(filepath.Join(out, file.Path))
+		if err != nil {
+			t.Fatalf("read %s lookup: %v", name, err)
+		}
+		if got := fmt.Sprintf("%x", sha256.Sum256(data)); got != file.SHA256 {
+			t.Fatalf("%s checksum = %s, want %s", name, got, file.SHA256)
+		}
+		var lookup map[string]json.RawMessage
+		if err := json.Unmarshal(data, &lookup); err != nil {
+			t.Fatalf("decode %s lookup: %v", name, err)
+		}
+		if name == "contacts" {
+			if len(lookup) != file.Records {
+				t.Fatalf("contacts lookup has %d entries, want %d", len(lookup), file.Records)
+			}
+			for participantID, raw := range lookup {
+				if bytes.Contains(raw, []byte(`"participant_id"`)) {
+					t.Fatalf("contact %s redundantly contains participant_id", participantID)
+				}
+			}
+		}
 	}
 	totalMessages := 0
 	for _, file := range manifest.ConversationMessages {

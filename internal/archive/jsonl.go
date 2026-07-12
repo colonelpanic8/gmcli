@@ -39,6 +39,23 @@ type jsonlConversationFile struct {
 	SHA256         string `json:"sha256"`
 }
 
+const jsonlFormatVersion = 2
+
+type contactLookupValue struct {
+	SourcePlatform  string `json:"source_platform"`
+	ContactID       string `json:"contact_id"`
+	Name            string `json:"name"`
+	E164            string `json:"e164"`
+	FormattedNumber string `json:"formatted_number"`
+	AvatarColor     string `json:"avatar_color"`
+	IsMe            bool   `json:"is_me"`
+}
+
+type aliasLookupValue struct {
+	Alias     string    `json:"alias"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // VerifyResult describes a successfully verified JSONL archive.
 type VerifyResult struct {
 	Path          string `json:"path"`
@@ -114,19 +131,19 @@ func writeJSONLSnapshot(ctx context.Context, st *store.Store, dir string) (Resul
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&schemaVersion); err != nil {
 		return Result{}, jsonlManifest{}, fmt.Errorf("read schema version: %w", err)
 	}
-	result := Result{Format: "gmcli-jsonl-archive", FormatVersion: FormatVersion, SchemaVersion: schemaVersion}
+	result := Result{Format: "gmcli-jsonl-archive", FormatVersion: jsonlFormatVersion, SchemaVersion: schemaVersion}
 
 	conversationFile, err := writeJSONLFile(ctx, tx, filepath.Join(dir, "conversations.jsonl"), conversationsQuery, scanConversation)
 	if err != nil {
 		return Result{}, jsonlManifest{}, err
 	}
 	result.Conversations = conversationFile.Records
-	contactFile, err := writeJSONLFile(ctx, tx, filepath.Join(dir, "contacts.jsonl"), contactsQuery, scanContact)
+	contactFile, err := writeContactLookup(ctx, tx, filepath.Join(dir, "contacts.json"))
 	if err != nil {
 		return Result{}, jsonlManifest{}, err
 	}
 	result.Contacts = contactFile.Records
-	aliasFile, err := writeJSONLFile(ctx, tx, filepath.Join(dir, "aliases.jsonl"), aliasesQuery, scanAlias)
+	aliasFile, err := writeAliasLookup(ctx, tx, filepath.Join(dir, "aliases.json"))
 	if err != nil {
 		return Result{}, jsonlManifest{}, err
 	}
@@ -172,12 +189,90 @@ func writeJSONLSnapshot(ctx context.Context, st *store.Store, dir string) (Resul
 		ExportedAt:    time.Now().UTC(),
 		Files: map[string]jsonlFile{
 			"conversations": {Path: "conversations.jsonl", Records: conversationFile.Records, SHA256: conversationFile.SHA256},
-			"contacts":      {Path: "contacts.jsonl", Records: contactFile.Records, SHA256: contactFile.SHA256},
-			"aliases":       {Path: "aliases.jsonl", Records: aliasFile.Records, SHA256: aliasFile.SHA256},
+			"contacts":      {Path: "contacts.json", Records: contactFile.Records, SHA256: contactFile.SHA256},
+			"aliases":       {Path: "aliases.json", Records: aliasFile.Records, SHA256: aliasFile.SHA256},
 		},
 		ConversationMessages: conversationFiles,
 	}
 	return result, manifest, nil
+}
+
+func writeContactLookup(ctx context.Context, tx *sql.Tx, path string) (jsonlFile, error) {
+	rows, err := tx.QueryContext(ctx, contactsQuery)
+	if err != nil {
+		return jsonlFile{}, fmt.Errorf("query contacts.json: %w", err)
+	}
+	defer rows.Close()
+	values := make(map[string]contactLookupValue)
+	for rows.Next() {
+		contact, err := scanContact(rows)
+		if err != nil {
+			return jsonlFile{}, fmt.Errorf("scan contacts.json: %w", err)
+		}
+		values[contact.ParticipantID] = contactLookupValue{
+			SourcePlatform: contact.SourcePlatform, ContactID: contact.ContactID,
+			Name: contact.Name, E164: contact.E164, FormattedNumber: contact.FormattedNumber,
+			AvatarColor: contact.AvatarColor, IsMe: contact.IsMe,
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return jsonlFile{}, fmt.Errorf("read contacts.json: %w", err)
+	}
+	return writeLookupFile(path, values, len(values))
+}
+
+func writeAliasLookup(ctx context.Context, tx *sql.Tx, path string) (jsonlFile, error) {
+	rows, err := tx.QueryContext(ctx, aliasesQuery)
+	if err != nil {
+		return jsonlFile{}, fmt.Errorf("query aliases.json: %w", err)
+	}
+	defer rows.Close()
+	values := make(map[string]map[string]aliasLookupValue)
+	count := 0
+	for rows.Next() {
+		alias, err := scanAlias(rows)
+		if err != nil {
+			return jsonlFile{}, fmt.Errorf("scan aliases.json: %w", err)
+		}
+		targetType := string(alias.TargetType)
+		if values[targetType] == nil {
+			values[targetType] = make(map[string]aliasLookupValue)
+		}
+		values[targetType][alias.TargetID] = aliasLookupValue{Alias: alias.Alias, UpdatedAt: alias.UpdatedAt}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return jsonlFile{}, fmt.Errorf("read aliases.json: %w", err)
+	}
+	return writeLookupFile(path, values, count)
+}
+
+func writeLookupFile(path string, value any, records int) (jsonlFile, error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return jsonlFile{}, fmt.Errorf("create %s: %w", path, err)
+	}
+	ok := false
+	defer func() {
+		_ = f.Close()
+		if !ok {
+			_ = os.Remove(path)
+		}
+	}()
+	hash := sha256.New()
+	enc := json.NewEncoder(io.MultiWriter(f, hash))
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(value); err != nil {
+		return jsonlFile{}, fmt.Errorf("encode %s: %w", filepath.Base(path), err)
+	}
+	if err := f.Sync(); err != nil {
+		return jsonlFile{}, fmt.Errorf("sync %s: %w", filepath.Base(path), err)
+	}
+	if err := f.Close(); err != nil {
+		return jsonlFile{}, fmt.Errorf("close %s: %w", filepath.Base(path), err)
+	}
+	ok = true
+	return jsonlFile{Path: filepath.Base(path), Records: records, SHA256: fmt.Sprintf("%x", hash.Sum(nil))}, nil
 }
 
 func listConversationIDs(ctx context.Context, tx *sql.Tx) ([]string, error) {
@@ -318,7 +413,7 @@ func VerifyJSONL(path string) (VerifyResult, error) {
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		return VerifyResult{}, fmt.Errorf("decode manifest: %w", err)
 	}
-	if manifest.Format != "gmcli-jsonl-archive" || manifest.FormatVersion != FormatVersion {
+	if manifest.Format != "gmcli-jsonl-archive" || (manifest.FormatVersion != 1 && manifest.FormatVersion != jsonlFormatVersion) {
 		return VerifyResult{}, fmt.Errorf("unsupported archive format %q version %d", manifest.Format, manifest.FormatVersion)
 	}
 	result := VerifyResult{
@@ -334,7 +429,11 @@ func VerifyJSONL(path string) (VerifyResult, error) {
 		if !ok {
 			return VerifyResult{}, fmt.Errorf("manifest is missing %s file", name)
 		}
-		if err := verifyJSONLFile(abs, file.Path, file.Records, file.SHA256, ""); err != nil {
+		if manifest.FormatVersion == 1 || name == "conversations" {
+			if err := verifyJSONLFile(abs, file.Path, file.Records, file.SHA256, ""); err != nil {
+				return VerifyResult{}, err
+			}
+		} else if err := verifyLookupFile(abs, file.Path, file.Records, file.SHA256, name == "aliases"); err != nil {
 			return VerifyResult{}, err
 		}
 		if _, exists := tablePaths[file.Path]; exists {
@@ -387,6 +486,68 @@ func VerifyJSONL(path string) (VerifyResult, error) {
 		result.Messages += file.Messages
 	}
 	return result, nil
+}
+
+func verifyLookupFile(root, relativePath string, wantRecords int, wantSHA string, nested bool) error {
+	path, err := safeArchivePath(root, relativePath)
+	if err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", relativePath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("archive path %s is not a regular file", relativePath)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", relativePath, err)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(data)); got != wantSHA {
+		return fmt.Errorf("%s SHA-256 mismatch: got %s, want %s", relativePath, got, wantSHA)
+	}
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(data, &values); err != nil {
+		return fmt.Errorf("decode %s: %w", relativePath, err)
+	}
+	records := len(values)
+	if nested {
+		records = 0
+		for targetType, raw := range values {
+			if targetType != string(store.AliasContact) && targetType != string(store.AliasConversation) {
+				return fmt.Errorf("%s contains unknown alias target type %q", relativePath, targetType)
+			}
+			var targets map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &targets); err != nil {
+				return fmt.Errorf("decode %s target %q: %w", relativePath, targetType, err)
+			}
+			for targetID, value := range targets {
+				if targetID == "" {
+					return fmt.Errorf("%s contains an empty alias target ID", relativePath)
+				}
+				var alias aliasLookupValue
+				if err := json.Unmarshal(value, &alias); err != nil {
+					return fmt.Errorf("decode %s alias %q: %w", relativePath, targetID, err)
+				}
+			}
+			records += len(targets)
+		}
+	} else {
+		for key, raw := range values {
+			if key == "" {
+				return fmt.Errorf("%s contains an empty lookup key", relativePath)
+			}
+			var contact contactLookupValue
+			if err := json.Unmarshal(raw, &contact); err != nil {
+				return fmt.Errorf("decode %s contact %q: %w", relativePath, key, err)
+			}
+		}
+	}
+	if records != wantRecords {
+		return fmt.Errorf("%s contains %d records, manifest says %d", relativePath, records, wantRecords)
+	}
+	return nil
 }
 
 func verifyJSONLFile(root, relativePath string, wantRecords int, wantSHA, conversationID string) error {

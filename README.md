@@ -165,7 +165,23 @@ gmcli export verify --dir ~/Backups/gmcli/latest
 gmcli coverage
 gmcli --json coverage --conversation <conv-id>
 gmcli coverage verify
+
+# Query the portable archive directly. JSONL is authoritative; the SQLite/FTS
+# index under $XDG_CACHE_HOME is disposable and incrementally rebuilt from the
+# manifest hashes. Pass --rebuild-cache to discard it completely.
+gmcli archive meta --dir ~/Backups/gmcli/latest
+gmcli archive conversations --dir ~/Backups/gmcli/latest
+gmcli archive search '"flight details"' --dir ~/Backups/gmcli/latest
+gmcli archive messages <conv-id> --dir ~/Backups/gmcli/latest --limit 200
+gmcli archive context <conv-id> <message-id> --dir ~/Backups/gmcli/latest
 ```
+
+`gmcli archive` is the renderer-independent query boundary for portable
+backups. Its typed query layer is shared by the table and `--json` CLI output
+and is intended to support a future TUI or viewer without making SQLite the
+source of truth. The default cache path is derived from the archive's absolute
+path; a cache is pinned to one archive and gmcli refuses to repurpose an
+unrelated SQLite database supplied through `--cache`.
 
 Coverage is evidence-based and is never inferred from message counts. Each
 successful history page immediately records a per-conversation half-open time
@@ -211,7 +227,7 @@ conversation has reached an empty history page.
 ## Layout
 
 ```
-cmd/                  Cobra command tree (auth, sync, version, doctor,
+cmd/                  Cobra command tree (auth, sync, archive queries,
                       messages, contacts, chats, send, media, export, android)
 internal/
   androidtelephony/    Verified, segmented Android SMS/MMS provider export
@@ -219,6 +235,7 @@ internal/
   gm/                 libgm wrapper — pairing, session, events, send/react,
                       WaitForReady, DownloadMedia
   store/              SQLite + FTS5 store (schema v4: aliases, send cache, coverage)
+  viewer/             JSONL-authoritative queries + disposable SQLite/FTS cache
   sync/               Event-to-store pump
   output/             Shared JSON / tab-aligned table renderers
   paths/              XDG path resolution (XDG_STATE_HOME)

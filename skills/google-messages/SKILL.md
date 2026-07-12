@@ -167,6 +167,25 @@ archive when a focused query will do.
    buffers, and downloaded media bytes. The command refuses to overwrite an
    existing file unless the user explicitly authorizes `--force`.
 
+9. **Query a portable segmented JSONL archive.** When the user supplies or
+   approves an archive directory, use the `archive` commands instead of the
+   live store commands. JSONL remains the source of truth; gmcli creates a
+   disposable SQLite/FTS cache under `$XDG_CACHE_HOME` and incrementally
+   refreshes only files whose manifest hashes changed:
+
+   ```
+   gmcli --json --read-only archive meta --dir '{archive_dir}'
+   gmcli --json --read-only archive conversations --dir '{archive_dir}' --limit 200
+   gmcli --json --read-only archive search '"{query}"' --dir '{archive_dir}' --limit 100
+   gmcli --json --read-only archive messages {conversation_id} --dir '{archive_dir}' --limit 200
+   gmcli --json --read-only archive context {conversation_id} {message_id} --dir '{archive_dir}' --before 5 --after 5
+   ```
+
+   `archive messages` returns opaque `before_cursor` and `after_cursor` values.
+   Pass them back unchanged with `--before` or `--after`; never parse or
+   synthesize them. `--rebuild-cache` is safe because it deletes only the
+   derived cache, but use it only when troubleshooting or when the user asks.
+
 ### Health check
 
 If results are unexpectedly empty or the user mentions a recent message you

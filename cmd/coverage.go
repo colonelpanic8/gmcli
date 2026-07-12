@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -50,6 +51,38 @@ type coverageReport struct {
 	Conversations map[string]coverageConversationView `json:"conversations"`
 }
 
+var defaultRequiredCoverageFolders = []string{"INBOX", "ARCHIVE", "SPAM_BLOCKED"}
+
+type coverageFolderVerificationSummary struct {
+	Required int            `json:"required"`
+	Complete int            `json:"complete"`
+	Missing  int            `json:"missing"`
+	Failed   int            `json:"failed"`
+	Partial  int            `json:"partial"`
+	ByStatus map[string]int `json:"by_status"`
+}
+
+type coverageConversationVerificationSummary struct {
+	Conversations   int            `json:"conversations"`
+	SourceExhausted int            `json:"source_exhausted"`
+	NotAttempted    int            `json:"not_attempted"`
+	InProgress      int            `json:"in_progress"`
+	Partial         int            `json:"partial"`
+	Failed          int            `json:"failed"`
+	ByStatus        map[string]int `json:"by_status"`
+}
+
+type coverageVerification struct {
+	Version                 int                                     `json:"version"`
+	VerifiedAt              time.Time                               `json:"verified_at"`
+	Complete                bool                                    `json:"complete"`
+	RequiredFolders         []string                                `json:"required_folders"`
+	FolderSummary           coverageFolderVerificationSummary       `json:"folder_summary"`
+	ConversationSummary     coverageConversationVerificationSummary `json:"conversation_summary"`
+	FolderStatuses          map[string]string                       `json:"folder_statuses"`
+	IncompleteConversations map[string]string                       `json:"incomplete_conversations,omitempty"`
+}
+
 func coverageCmd() *cobra.Command {
 	var conversationID string
 	c := &cobra.Command{
@@ -84,7 +117,151 @@ func coverageCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&conversationID, "conversation", "", "show one conversation_id")
+	c.AddCommand(coverageVerifyCmd())
 	return c
+}
+
+func coverageVerifyCmd() *cobra.Command {
+	requiredFolders := append([]string(nil), defaultRequiredCoverageFolders...)
+	c := &cobra.Command{
+		Use:   "verify",
+		Short: "Fail unless folder discovery and all conversation history are complete",
+		Long: "Verify that every required conversation folder has complete discovery coverage " +
+			"and every locally known conversation is source-exhausted. The command exits nonzero " +
+			"when either condition is not met.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			folders, err := normalizeRequiredCoverageFolders(requiredFolders)
+			if err != nil {
+				return err
+			}
+			st, err := openStore()
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			report, err := buildCoverageReport(cmd.Context(), st)
+			if err != nil {
+				return err
+			}
+			verification := verifyCoverageReport(report, folders)
+			if flags.jsonOut {
+				if err := output.JSON(os.Stdout, verification); err != nil {
+					return err
+				}
+			} else {
+				renderCoverageVerification(verification)
+			}
+			return coverageVerificationFailure(verification)
+		},
+	}
+	c.Flags().StringSliceVar(&requiredFolders, "folder", requiredFolders, "required folder name (repeat or use comma-separated values)")
+	return c
+}
+
+func coverageVerificationFailure(verification coverageVerification) error {
+	if verification.Complete {
+		return nil
+	}
+	return fmt.Errorf("coverage verification failed: %d/%d required folders complete and %d/%d conversations source-exhausted",
+		verification.FolderSummary.Complete, verification.FolderSummary.Required,
+		verification.ConversationSummary.SourceExhausted, verification.ConversationSummary.Conversations)
+}
+
+func normalizeRequiredCoverageFolders(values []string) ([]string, error) {
+	seen := make(map[string]struct{})
+	folders := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			folder := strings.ToUpper(strings.TrimSpace(part))
+			if folder == "" {
+				continue
+			}
+			if _, ok := seen[folder]; ok {
+				continue
+			}
+			seen[folder] = struct{}{}
+			folders = append(folders, folder)
+		}
+	}
+	if len(folders) == 0 {
+		return nil, fmt.Errorf("at least one --folder is required")
+	}
+	return folders, nil
+}
+
+func verifyCoverageReport(report coverageReport, requiredFolders []string) coverageVerification {
+	result := coverageVerification{
+		Version: 1, VerifiedAt: time.Now().UTC(), RequiredFolders: append([]string(nil), requiredFolders...),
+		FolderSummary: coverageFolderVerificationSummary{Required: len(requiredFolders), ByStatus: make(map[string]int)},
+		ConversationSummary: coverageConversationVerificationSummary{
+			Conversations: report.Summary.Conversations,
+			ByStatus:      make(map[string]int),
+		},
+		FolderStatuses:          make(map[string]string, len(requiredFolders)),
+		IncompleteConversations: make(map[string]string),
+	}
+	for _, folder := range requiredFolders {
+		status := "missing"
+		if value, ok := report.Folders[folder]; ok {
+			status = value.Status
+		}
+		result.FolderStatuses[folder] = status
+		result.FolderSummary.ByStatus[status]++
+		switch status {
+		case store.CoverageComplete:
+			result.FolderSummary.Complete++
+		case "missing":
+			result.FolderSummary.Missing++
+		case store.CoverageFailed:
+			result.FolderSummary.Failed++
+		case store.CoveragePartial:
+			result.FolderSummary.Partial++
+		}
+	}
+	for id, conversation := range report.Conversations {
+		status := conversation.Status
+		result.ConversationSummary.ByStatus[status]++
+		switch status {
+		case store.CoverageSourceExhausted:
+			result.ConversationSummary.SourceExhausted++
+		case store.CoverageNotAttempted:
+			result.ConversationSummary.NotAttempted++
+		case store.CoverageInProgress:
+			result.ConversationSummary.InProgress++
+		case store.CoveragePartial:
+			result.ConversationSummary.Partial++
+		case store.CoverageFailed:
+			result.ConversationSummary.Failed++
+		}
+		if status != store.CoverageSourceExhausted {
+			result.IncompleteConversations[id] = status
+		}
+	}
+	result.Complete = result.FolderSummary.Complete == result.FolderSummary.Required &&
+		result.ConversationSummary.SourceExhausted == result.ConversationSummary.Conversations
+	return result
+}
+
+func renderCoverageVerification(result coverageVerification) {
+	status := "INCOMPLETE"
+	if result.Complete {
+		status = "COMPLETE"
+	}
+	fmt.Printf("Coverage verification: %s\n", status)
+	fmt.Printf("Required folders: %d/%d complete; %d missing, %d failed, %d partial\n",
+		result.FolderSummary.Complete, result.FolderSummary.Required, result.FolderSummary.Missing,
+		result.FolderSummary.Failed, result.FolderSummary.Partial)
+	fmt.Printf("Conversations: %d/%d source-exhausted\n",
+		result.ConversationSummary.SourceExhausted, result.ConversationSummary.Conversations)
+	statuses := make([]string, 0, len(result.ConversationSummary.ByStatus))
+	for status := range result.ConversationSummary.ByStatus {
+		statuses = append(statuses, status)
+	}
+	sort.Strings(statuses)
+	for _, status := range statuses {
+		fmt.Printf("  %-18s %d\n", status, result.ConversationSummary.ByStatus[status])
+	}
 }
 
 func buildCoverageReport(ctx context.Context, st *store.Store) (coverageReport, error) {

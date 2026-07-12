@@ -54,8 +54,12 @@ func (s *Store) StartConversationCoverage(ctx context.Context, conversationID st
 			conversation_id, status, last_attempt_ts, updated_at
 		) VALUES (?, 'in_progress', ?, ?)
 		ON CONFLICT(conversation_id) DO UPDATE SET
-			status = 'in_progress', last_attempt_ts = excluded.last_attempt_ts,
-			terminal_reason = '', last_error = '', last_requests = 0,
+			status = CASE WHEN conversation_coverage.status = 'source_exhausted'
+				THEN conversation_coverage.status ELSE 'in_progress' END,
+			last_attempt_ts = excluded.last_attempt_ts,
+			terminal_reason = CASE WHEN conversation_coverage.status = 'source_exhausted'
+				THEN conversation_coverage.terminal_reason ELSE '' END,
+			last_error = '', last_requests = 0,
 			last_records_fetched = 0, updated_at = excluded.updated_at`,
 		conversationID, now, now)
 	return err
@@ -131,12 +135,16 @@ func (s *Store) FinishConversationCoverage(ctx context.Context, conversationID, 
 	}
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE conversation_coverage
-		   SET status = ?, terminal_reason = ?, last_error = ?,
+		   SET status = CASE WHEN status = 'source_exhausted' AND ? != 'source_exhausted'
+				THEN status ELSE ? END,
+		       terminal_reason = CASE WHEN status = 'source_exhausted' AND ? != 'source_exhausted'
+				THEN terminal_reason ELSE ? END,
+		       last_error = ?,
 		       history_start_ms = COALESCE(?, history_start_ms),
 		       exhausted_at = CASE WHEN ? > 0 THEN ? ELSE exhausted_at END,
 		       last_requests = ?, last_records_fetched = ?, updated_at = ?
 		 WHERE conversation_id = ?`,
-		status, reason, lastError, historyStartMS, exhaustedAt, exhaustedAt,
+		status, status, status, reason, lastError, historyStartMS, exhaustedAt, exhaustedAt,
 		requests, records, now, conversationID)
 	return err
 }
@@ -237,6 +245,30 @@ func (s *Store) ListConversationCoverage(ctx context.Context) ([]ConversationCov
 		out[i].Segments = segments
 	}
 	return out, nil
+}
+
+// SourceExhaustedConversationIDs returns the IDs whose history endpoint has
+// returned an empty page, proving that the available source history was
+// exhausted. Conversations without coverage rows are intentionally omitted.
+func (s *Store) SourceExhaustedConversationIDs(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT conversation_id
+		  FROM conversation_coverage
+		 WHERE status = ?`, CoverageSourceExhausted)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := make(map[string]struct{})
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = struct{}{}
+	}
+	return ids, rows.Err()
 }
 
 func (s *Store) listCoverageSegments(ctx context.Context, conversationID string) ([]CoverageSegment, error) {

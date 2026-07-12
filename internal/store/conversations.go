@@ -120,6 +120,30 @@ func (s *Store) ListConversations(ctx context.Context, opts ListConversationOpts
 	return out, rows.Err()
 }
 
+// ListConversationsByID returns the complete conversation set in stable ID
+// order. It is intended for resumable whole-archive passes, where timestamp
+// ordering and a separate count/limit query would make the cursor unstable.
+func (s *Store) ListConversationsByID(ctx context.Context) ([]Conversation, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT conversation_id, source_platform, name, is_group, participants_json,
+		       last_message_ts, unread, pinned, archived, updated_at
+		  FROM conversations
+		 ORDER BY conversation_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list conversations by ID: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Conversation, 0)
+	for rows.Next() {
+		conversation, err := scanConversation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, conversation)
+	}
+	return out, rows.Err()
+}
+
 // scanConversation reads a single row in the canonical column order. Used by
 // both GetConversation and ListConversations.
 func scanConversation(r interface {

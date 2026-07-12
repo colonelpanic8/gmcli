@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -35,19 +36,33 @@ type historyBackfillError struct {
 	Error          string `json:"error"`
 }
 
+type historyBackfillAttemptOutcome string
+
+const (
+	historyBackfillOutcomeExhausted       historyBackfillAttemptOutcome = "exhausted"
+	historyBackfillOutcomePartial         historyBackfillAttemptOutcome = "partial"
+	historyBackfillOutcomeFailed          historyBackfillAttemptOutcome = "failed"
+	historyBackfillOutcomeTerminalFailure historyBackfillAttemptOutcome = "terminal_failure"
+)
+
 type historyBackfillAllResult struct {
-	Conversations   int                     `json:"conversations"`
-	Offset          int                     `json:"offset"`
-	Attempted       int                     `json:"attempted"`
-	NextOffset      int                     `json:"next_offset"`
-	Completed       int                     `json:"completed"`
-	Failed          int                     `json:"failed"`
-	Exhausted       int                     `json:"exhausted"`
-	NeedsMore       int                     `json:"needs_more"`
-	FetchedMessages int                     `json:"fetched_messages"`
-	MessagesAdded   int                     `json:"messages_added"`
-	Results         []historyBackfillResult `json:"results"`
-	Errors          []historyBackfillError  `json:"errors,omitempty"`
+	Conversations           int                     `json:"conversations"`
+	Eligible                int                     `json:"eligible"`
+	SkippedExhausted        int                     `json:"skipped_exhausted"`
+	Selected                int                     `json:"selected"`
+	Offset                  int                     `json:"offset,omitempty"`
+	AfterConversationID     string                  `json:"after_conversation_id"`
+	Attempted               int                     `json:"attempted"`
+	NextOffset              int                     `json:"next_offset,omitempty"`
+	NextAfterConversationID string                  `json:"next_after_conversation_id"`
+	Completed               int                     `json:"completed"`
+	Failed                  int                     `json:"failed"`
+	Exhausted               int                     `json:"exhausted"`
+	NeedsMore               int                     `json:"needs_more"`
+	FetchedMessages         int                     `json:"fetched_messages"`
+	MessagesAdded           int                     `json:"messages_added"`
+	Results                 []historyBackfillResult `json:"results"`
+	Errors                  []historyBackfillError  `json:"errors,omitempty"`
 }
 
 func historyCmd() *cobra.Command {
@@ -67,11 +82,17 @@ func historyBackfillAllCmd() *cobra.Command {
 	var count int64
 	var offset int
 	var limit int
+	var includeExhausted bool
+	var afterConversationID string
 	c := &cobra.Command{
 		Use:   "backfill-all",
 		Short: "Fetch older messages for every locally known conversation",
 		Long: "Fetch older messages for every locally known conversation over one connection. " +
-			"Failures are recorded per conversation so the remaining archive can continue.",
+			"Conversations already proven source-exhausted are skipped by default. Failures are " +
+			"recorded per conversation so the remaining archive can continue. Resume a bounded or " +
+			"interrupted pass with next_after_conversation_id from JSON output. Conversation IDs are " +
+			"ordered lexicographically, making the cursor stable when message timestamps or coverage " +
+			"statuses change. Use `gmcli coverage verify` as the archive completeness gate.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if requests <= 0 {
 				requests = 10
@@ -79,22 +100,34 @@ func historyBackfillAllCmd() *cobra.Command {
 			if count <= 0 {
 				count = 50
 			}
-			res, err := runHistoryBackfillAll(requests, count, offset, limit)
+			if err := validateHistoryBackfillResume(offset, afterConversationID); err != nil {
+				return err
+			}
+			res, err := runHistoryBackfillAll(requests, count, offset, limit, includeExhausted, afterConversationID)
+			// A nil Results slice means the pass snapshot was never validated
+			// (for example, a stale key cursor). Do not print a zero-attempt
+			// summary that could be mistaken for a completed pass.
+			if err != nil && res.Results == nil {
+				return err
+			}
 			if flags.jsonOut {
 				if outputErr := output.JSON(os.Stdout, res); outputErr != nil {
 					return outputErr
 				}
 			} else {
-				fmt.Fprintf(os.Stderr, "Backfilled %d/%d attempted conversation(s): fetched %d message record(s), added %d local message(s); %d exhausted, %d need more, %d failed; next offset %d\n",
-					res.Completed, res.Attempted, res.FetchedMessages, res.MessagesAdded, res.Exhausted, res.NeedsMore, res.Failed, res.NextOffset)
+				fmt.Fprintf(os.Stderr, "Backfilled %d/%d attempted conversation(s): fetched %d message record(s), added %d local message(s); %d exhausted, %d need more, %d failed, %d previously exhausted skipped; next after-conversation-id %q\n",
+					res.Completed, res.Attempted, res.FetchedMessages, res.MessagesAdded, res.Exhausted, res.NeedsMore, res.Failed, res.SkippedExhausted, res.NextAfterConversationID)
+				fmt.Fprintln(os.Stderr, "Run `gmcli coverage verify` to determine archive completeness.")
 			}
 			return err
 		},
 	}
 	c.Flags().IntVar(&requests, "requests", 10, "max FetchMessages calls to make per conversation")
 	c.Flags().Int64Var(&count, "count", 50, "max message records to request per FetchMessages call")
-	c.Flags().IntVar(&offset, "offset", 0, "skip this many locally known conversations (for resumable runs)")
-	c.Flags().IntVar(&limit, "limit", 0, "process at most this many conversations after --offset (0 means all)")
+	c.Flags().IntVar(&offset, "offset", 0, "deprecated; nonzero offsets are rejected, use --after-conversation-id")
+	c.Flags().StringVar(&afterConversationID, "after-conversation-id", "", "resume after this conversation ID from a prior pass")
+	c.Flags().IntVar(&limit, "limit", 0, "process at most this many eligible conversations after the resume cursor (0 means all)")
+	c.Flags().BoolVar(&includeExhausted, "include-exhausted", false, "include and recheck conversations already marked source-exhausted")
 	return c
 }
 
@@ -168,7 +201,10 @@ func runHistoryBackfill(chat string, requests int, count int64) (historyBackfill
 	return runHistoryBackfillConnected(ctx, st, client, pump, chat, requests, count)
 }
 
-func runHistoryBackfillAll(requests int, count int64, offset, limit int) (historyBackfillAllResult, error) {
+func runHistoryBackfillAll(requests int, count int64, offset, limit int, includeExhausted bool, afterConversationID string) (historyBackfillAllResult, error) {
+	if err := validateHistoryBackfillResume(offset, afterConversationID); err != nil {
+		return historyBackfillAllResult{}, err
+	}
 	layout, err := resolveLayout()
 	if err != nil {
 		return historyBackfillAllResult{}, err
@@ -183,30 +219,26 @@ func runHistoryBackfillAll(requests int, count int64, offset, limit int) (histor
 	}
 	defer st.Close()
 
-	total, err := st.CountConversations(ctx)
-	if err != nil {
-		return historyBackfillAllResult{}, fmt.Errorf("count conversations: %w", err)
-	}
-	conversations, err := st.ListConversations(ctx, store.ListConversationOpts{Limit: total})
+	conversations, err := st.ListConversationsByID(ctx)
 	if err != nil {
 		return historyBackfillAllResult{}, err
 	}
-	if offset < 0 {
-		return historyBackfillAllResult{}, fmt.Errorf("offset must be non-negative")
+	exhaustedIDs, err := st.SourceExhaustedConversationIDs(ctx)
+	if err != nil {
+		return historyBackfillAllResult{}, fmt.Errorf("list source-exhausted conversations: %w", err)
 	}
-	if offset > len(conversations) {
-		offset = len(conversations)
-	}
-	selected := conversations[offset:]
-	if limit > 0 && limit < len(selected) {
-		selected = selected[:limit]
+	selected, eligible, skippedExhausted, err := selectHistoryBackfillConversations(conversations, exhaustedIDs, includeExhausted, afterConversationID, limit)
+	if err != nil {
+		return historyBackfillAllResult{}, err
 	}
 	result := historyBackfillAllResult{
-		Conversations: len(conversations),
-		Offset:        offset,
-		Attempted:     len(selected),
-		NextOffset:    offset,
-		Results:       make([]historyBackfillResult, 0, len(selected)),
+		Conversations:           len(conversations),
+		Eligible:                eligible,
+		SkippedExhausted:        skippedExhausted,
+		Selected:                len(selected),
+		AfterConversationID:     afterConversationID,
+		NextAfterConversationID: afterConversationID,
+		Results:                 make([]historyBackfillResult, 0, len(selected)),
 	}
 	if len(selected) == 0 {
 		return result, nil
@@ -224,18 +256,19 @@ func runHistoryBackfillAll(requests int, count int64, offset, limit int) (histor
 	defer client.Disconnect()
 
 	for i, conversation := range selected {
-		absoluteIndex := offset + i
-		fmt.Fprintf(os.Stderr, "Backfilling conversation %d/%d (%s)\n", absoluteIndex+1, len(conversations), conversation.ID)
+		fmt.Fprintf(os.Stderr, "Backfilling selected conversation %d/%d (%s)\n", i+1, len(selected), conversation.ID)
+		result.Attempted++
 		res, err := runHistoryBackfillConnected(ctx, st, client, pump, conversation.ID, requests, count)
 		if err != nil {
 			result.Failed++
 			result.Errors = append(result.Errors, historyBackfillError{ConversationID: conversation.ID, Error: err.Error()})
 			fmt.Fprintf(os.Stderr, "Backfill failed for %s: %v\n", conversation.ID, err)
 			if isTerminalSessionError(err) {
-				result.NextOffset = absoluteIndex
-				return result, fmt.Errorf("session expired at conversation offset %d; re-pair and resume with --offset %d: %w", absoluteIndex, absoluteIndex, err)
+				result.NextAfterConversationID = nextHistoryBackfillCursor(result.NextAfterConversationID, conversation.ID, historyBackfillOutcomeTerminalFailure)
+				return result, fmt.Errorf("session expired at conversation %s; re-pair and resume %s: %w",
+					conversation.ID, historyBackfillResumeHint(result.NextAfterConversationID), err)
 			}
-			result.NextOffset = absoluteIndex + 1
+			result.NextAfterConversationID = nextHistoryBackfillCursor(result.NextAfterConversationID, conversation.ID, historyBackfillOutcomeFailed)
 			continue
 		}
 		result.Completed++
@@ -247,12 +280,79 @@ func runHistoryBackfillAll(requests int, count int64, offset, limit int) (histor
 		result.FetchedMessages += res.FetchedMessages
 		result.MessagesAdded += res.MessagesAddedForChat
 		result.Results = append(result.Results, res)
-		result.NextOffset = absoluteIndex + 1
+		outcome := historyBackfillOutcomePartial
+		if res.Exhausted {
+			outcome = historyBackfillOutcomeExhausted
+		}
+		result.NextAfterConversationID = nextHistoryBackfillCursor(result.NextAfterConversationID, conversation.ID, outcome)
 	}
 	if result.Failed > 0 || result.NeedsMore > 0 {
-		return result, fmt.Errorf("history backfill incomplete: %d conversation(s) failed and %d reached the request limit before exhaustion", result.Failed, result.NeedsMore)
+		return result, fmt.Errorf("history backfill pass incomplete: %d conversation(s) failed and %d reached the request limit before exhaustion", result.Failed, result.NeedsMore)
 	}
 	return result, nil
+}
+
+func validateHistoryBackfillResume(offset int, afterConversationID string) error {
+	if offset == 0 {
+		return nil
+	}
+	if afterConversationID != "" {
+		return fmt.Errorf("--offset and --after-conversation-id cannot be combined; nonzero --offset is no longer supported")
+	}
+	return fmt.Errorf("nonzero --offset is no longer supported because conversation ordering and eligibility can change; resume with --after-conversation-id from next_after_conversation_id")
+}
+
+func nextHistoryBackfillCursor(current, conversationID string, outcome historyBackfillAttemptOutcome) string {
+	if outcome == historyBackfillOutcomeTerminalFailure {
+		return current
+	}
+	return conversationID
+}
+
+func historyBackfillResumeHint(afterConversationID string) string {
+	if afterConversationID == "" {
+		return "without --after-conversation-id"
+	}
+	return fmt.Sprintf("with --after-conversation-id %q", afterConversationID)
+}
+
+func selectHistoryBackfillConversations(conversations []store.Conversation, exhaustedIDs map[string]struct{}, includeExhausted bool, afterConversationID string, limit int) ([]store.Conversation, int, int, error) {
+	ordered := append([]store.Conversation(nil), conversations...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].ID < ordered[j].ID })
+	if afterConversationID != "" {
+		found := false
+		for _, conversation := range ordered {
+			if conversation.ID == afterConversationID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, 0, 0, fmt.Errorf("after-conversation-id %q is not a locally known conversation; start a new pass without the stale cursor", afterConversationID)
+		}
+	}
+
+	eligible := make([]store.Conversation, 0, len(ordered))
+	skippedExhausted := 0
+	for _, conversation := range ordered {
+		_, exhausted := exhaustedIDs[conversation.ID]
+		if exhausted && !includeExhausted {
+			skippedExhausted++
+			continue
+		}
+		eligible = append(eligible, conversation)
+	}
+	eligibleCount := len(eligible)
+	selected := make([]store.Conversation, 0, len(eligible))
+	for _, conversation := range eligible {
+		if conversation.ID > afterConversationID {
+			selected = append(selected, conversation)
+		}
+	}
+	if limit > 0 && limit < len(selected) {
+		selected = selected[:limit]
+	}
+	return selected, eligibleCount, skippedExhausted, nil
 }
 
 func runHistoryBackfillConnected(ctx context.Context, st *store.Store, client *gm.Client, pump *gmsync.Pump, chat string, requests int, count int64) (historyBackfillResult, error) {

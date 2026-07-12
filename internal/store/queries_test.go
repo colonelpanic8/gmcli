@@ -91,6 +91,13 @@ func TestListConversationsOrdersByLastMessage(t *testing.T) {
 	if got[0].ID != "new" || got[1].ID != "mid" || got[2].ID != "old" {
 		t.Fatalf("wrong order: %s, %s, %s", got[0].ID, got[1].ID, got[2].ID)
 	}
+	byID, err := st.ListConversationsByID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byID) != 3 || byID[0].ID != "mid" || byID[1].ID != "new" || byID[2].ID != "old" {
+		t.Fatalf("stable ID order: %+v", byID)
+	}
 
 	// Unread-only filter.
 	unread, err := st.ListConversations(ctx, store.ListConversationOpts{UnreadOnly: true})

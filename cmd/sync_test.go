@@ -67,6 +67,38 @@ func TestRunSendSettingsRefreshSuccess(t *testing.T) {
 	}
 }
 
+type fakeConversationLister struct {
+	response *gmproto.ListConversationsResponse
+	wait     <-chan struct{}
+}
+
+func (f fakeConversationLister) ListConversationsWithCursor(_ int, _ gmproto.ListConversationsRequest_Folder, _ *gmproto.Cursor) (*gmproto.ListConversationsResponse, error) {
+	if f.wait != nil {
+		<-f.wait
+	}
+	return f.response, nil
+}
+
+func TestListConversationPage(t *testing.T) {
+	want := &gmproto.ListConversationsResponse{Conversations: []*gmproto.Conversation{{ConversationID: "conv-1"}}}
+	got, err := listConversationPage(context.Background(), fakeConversationLister{response: want}, 50, gmproto.ListConversationsRequest_INBOX, nil, time.Second)
+	if err != nil {
+		t.Fatalf("list page: %v", err)
+	}
+	if got.GetConversations()[0].GetConversationID() != "conv-1" {
+		t.Fatalf("unexpected response: %+v", got)
+	}
+}
+
+func TestListConversationPageTimeout(t *testing.T) {
+	wait := make(chan struct{})
+	_, err := listConversationPage(context.Background(), fakeConversationLister{wait: wait}, 50, gmproto.ListConversationsRequest_ARCHIVE, nil, time.Millisecond)
+	close(wait)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected timeout, got %v", err)
+	}
+}
+
 func TestRunSendSettingsRefreshTimeout(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gmcli.db"))

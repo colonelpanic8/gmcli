@@ -19,6 +19,18 @@ import (
 
 const syncHeartbeatInterval = 5 * time.Minute
 const sendSettingsRefreshTimeout = 60 * time.Second
+const defaultConversationDiscoveryLimit = 10_000
+const conversationFolderTimeout = 90 * time.Second
+const maxConversationPages = 100
+
+type conversationListClient interface {
+	ListConversationsWithCursor(int, gmproto.ListConversationsRequest_Folder, *gmproto.Cursor) (*gmproto.ListConversationsResponse, error)
+}
+
+type conversationListResult struct {
+	Response *gmproto.ListConversationsResponse
+	Error    error
+}
 
 type sendSettingsRefreshClient interface {
 	Subscribe(gm.EventHandler)
@@ -43,6 +55,8 @@ type sendSettingsRefreshResult struct {
 
 func syncCmd() *cobra.Command {
 	var follow bool
+	var conversationLimit int
+	var includeSpam bool
 	c := &cobra.Command{
 		Use:   "sync",
 		Short: "Connect to Google Messages and write events into the local store",
@@ -54,6 +68,9 @@ func syncCmd() *cobra.Command {
 			layout, err := resolveLayout()
 			if err != nil {
 				return err
+			}
+			if conversationLimit <= 0 {
+				return fmt.Errorf("--conversation-limit must be positive")
 			}
 			logger := newLogger()
 
@@ -87,22 +104,69 @@ func syncCmd() *cobra.Command {
 				logger.Info().Int("contacts", imported).Msg("Imported contacts")
 			}
 
-			if resp, err := client.Underlying().ListConversations(50, gmproto.ListConversationsRequest_INBOX); err != nil {
-				logger.Warn().Err(err).Msg("Conversation import failed")
-			} else {
-				convs, msgs := 0, 0
-				for _, conv := range resp.GetConversations() {
-					if conv == nil || conv.GetConversationID() == "" {
-						continue
+			folders := []gmproto.ListConversationsRequest_Folder{
+				gmproto.ListConversationsRequest_INBOX,
+			}
+			if includeSpam {
+				folders = append(folders, gmproto.ListConversationsRequest_SPAM_BLOCKED)
+			}
+			// Archive is last because some phone versions do not answer this
+			// folder request; the per-page timeout keeps sync bounded.
+			folders = append(folders, gmproto.ListConversationsRequest_ARCHIVE)
+			conversations := make(map[string]*gmproto.Conversation)
+			recentConversationIDs := make([]string, 0, 50)
+			for _, folder := range folders {
+				var cursor *gmproto.Cursor
+				serverPageSize := 0
+				for page := 1; page <= maxConversationPages; page++ {
+					resp, err := listConversationPage(ctx, client.Underlying(), conversationLimit, folder, cursor, conversationFolderTimeout)
+					if err != nil {
+						logger.Warn().Err(err).Str("folder", folder.String()).Int("page", page).Msg("Conversation folder import stopped")
+						break
 					}
-					pump.Handle(conv)
-					convs++
-					if history, err := client.Underlying().FetchMessages(conv.GetConversationID(), 10, nil); err != nil {
-						logger.Debug().Err(err).Str("conversation_id", conv.GetConversationID()).Msg("Recent message import failed")
-					} else {
-						msgs += pump.ImportMessages(ctx, history.GetMessages())
+					pageConversations := 0
+					for _, conv := range resp.GetConversations() {
+						if conv == nil || conv.GetConversationID() == "" {
+							continue
+						}
+						id := conv.GetConversationID()
+						if _, exists := conversations[id]; !exists && folder == gmproto.ListConversationsRequest_INBOX && len(recentConversationIDs) < 50 {
+							recentConversationIDs = append(recentConversationIDs, id)
+						}
+						conversations[id] = conv
+						pump.Handle(conv) // Persist every page before requesting the next one.
+						pageConversations++
 					}
+					logger.Info().Str("folder", folder.String()).Int("page", page).Int("conversations", pageConversations).Msg("Discovered conversation page")
+					if page == 1 {
+						serverPageSize = pageConversations
+					} else if pageConversations < serverPageSize {
+						// Google still returns a cursor on the final, short page.
+						break
+					}
+					next := resp.GetCursor()
+					if next == nil {
+						if len(resp.GetCursorBytes()) > 0 {
+							logger.Warn().Str("folder", folder.String()).Msg("Conversation response has an opaque cursor that this protocol version cannot continue")
+						}
+						break
+					}
+					if pageConversations == 0 || sameCursor(cursor, next) {
+						break
+					}
+					cursor = next
 				}
+			}
+			msgs := 0
+			for _, id := range recentConversationIDs {
+				if history, err := client.Underlying().FetchMessages(id, 10, nil); err != nil {
+					logger.Debug().Err(err).Str("conversation_id", id).Msg("Recent message import failed")
+				} else {
+					msgs += pump.ImportMessages(ctx, history.GetMessages())
+				}
+			}
+			convs := len(conversations)
+			if convs > 0 {
 				logger.Info().Int("conversations", convs).Int("messages", msgs).Msg("Imported recent conversation history")
 			}
 
@@ -135,8 +199,26 @@ func syncCmd() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&follow, "follow", false, "stay connected and stream events until interrupted")
+	c.Flags().IntVar(&conversationLimit, "conversation-limit", defaultConversationDiscoveryLimit, "max conversations to request from each folder")
+	c.Flags().BoolVar(&includeSpam, "include-spam", true, "discover conversations in Spam & blocked in addition to Inbox and Archive")
 	c.AddCommand(syncSendSettingsCmd())
 	return c
+}
+
+func listConversationPage(ctx context.Context, client conversationListClient, count int, folder gmproto.ListConversationsRequest_Folder, cursor *gmproto.Cursor, timeout time.Duration) (*gmproto.ListConversationsResponse, error) {
+	result := make(chan conversationListResult, 1)
+	go func() {
+		resp, err := client.ListConversationsWithCursor(count, folder, cursor)
+		result <- conversationListResult{Response: resp, Error: err}
+	}()
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	select {
+	case <-waitCtx.Done():
+		return nil, fmt.Errorf("list conversations timed out after %s: %w", timeout, waitCtx.Err())
+	case res := <-result:
+		return res.Response, res.Error
+	}
 }
 
 func syncSendSettingsCmd() *cobra.Command {

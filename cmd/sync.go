@@ -57,6 +57,7 @@ func syncCmd() *cobra.Command {
 	var follow bool
 	var conversationLimit int
 	var includeSpam bool
+	var includeArchive bool
 	c := &cobra.Command{
 		Use:   "sync",
 		Short: "Connect to Google Messages and write events into the local store",
@@ -112,7 +113,9 @@ func syncCmd() *cobra.Command {
 			}
 			// Archive is last because some phone versions do not answer this
 			// folder request; the per-page timeout keeps sync bounded.
-			folders = append(folders, gmproto.ListConversationsRequest_ARCHIVE)
+			if includeArchive {
+				folders = append(folders, gmproto.ListConversationsRequest_ARCHIVE)
+			}
 			conversations := make(map[string]*gmproto.Conversation)
 			recentConversationIDs := make([]string, 0, 50)
 			for _, folder := range folders {
@@ -200,7 +203,8 @@ func syncCmd() *cobra.Command {
 	}
 	c.Flags().BoolVar(&follow, "follow", false, "stay connected and stream events until interrupted")
 	c.Flags().IntVar(&conversationLimit, "conversation-limit", defaultConversationDiscoveryLimit, "max conversations to request from each folder")
-	c.Flags().BoolVar(&includeSpam, "include-spam", true, "discover conversations in Spam & blocked in addition to Inbox and Archive")
+	c.Flags().BoolVar(&includeSpam, "include-spam", true, "discover conversations in Spam & blocked in addition to Inbox")
+	c.Flags().BoolVar(&includeArchive, "include-archive", true, "discover conversations in Archive in addition to Inbox")
 	c.AddCommand(syncSendSettingsCmd())
 	return c
 }

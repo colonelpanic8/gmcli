@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -36,6 +37,23 @@ func TestOpenMigratesFreshDB(t *testing.T) {
 	}
 	if v, err := st.SchemaVersion(ctx); err != nil || v != 3 {
 		t.Fatalf("schema version: got %d err=%v, want 3", v, err)
+	}
+}
+
+func TestOpenSecuresDatabasePermissions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gmcli.db")
+	st, err := store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat store: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("database permissions = %04o, want 0600", got)
 	}
 }
 

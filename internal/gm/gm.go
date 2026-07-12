@@ -1,11 +1,12 @@
 // Package gm wraps go.mau.fi/mautrix-gmessages/pkg/libgm with the conventions
 // gmcli needs: filesystem-backed AuthData persistence, an event subscriber
-// model on top of libgm's single SetEventHandler, and helpers for the QR
-// pairing flow.
+// model on top of libgm's single SetEventHandler, and helpers for the QR and
+// Google Account pairing flows.
 //
 // Two entry points cover the lifecycle:
 //
-//	Pair(ctx, layout, render)         // first run: produces session.json
+//	Pair(ctx, layout, render)         // QR first run: produces session.json
+//	PairGoogle(ctx, layout, cookies)  // account/emoji first run
 //	Open(layout, logger) -> *Client   // subsequent runs: ready to Connect()
 //
 // The wrapper does not own a goroutine of its own; libgm runs the long-poll.
@@ -653,6 +654,11 @@ type PairResult struct {
 // is responsible for displaying it (terminal QR, plain URL, etc.).
 type QRRenderer func(qrURL string)
 
+// EmojiRenderer is invoked after Google Account pairing has started and the
+// phone is waiting for verification. The user must tap this emoji on the
+// Google Messages prompt.
+type EmojiRenderer func(emoji string)
+
 // Pair runs the QR pairing flow. It writes session.json on success and
 // returns the paired phone ID. Cancellable via ctx; otherwise bounded by
 // PairTimeout. Existing session.json (if any) is overwritten on success.
@@ -708,6 +714,43 @@ func Pair(ctx context.Context, layout paths.Layout, logger zerolog.Logger, rende
 		}
 		return &PairResult{PhoneID: res.PhoneID, SessionPath: layout.Session}, nil
 	}
+}
+
+// PairGoogle runs Google Account pairing. Google requires the authenticated
+// messages.google.com browser cookies for the account that is enabled for
+// pairing on the phone. The flow displays an emoji, waits for the matching
+// emoji to be selected on the phone, and persists the resulting session.
+func PairGoogle(ctx context.Context, layout paths.Layout, logger zerolog.Logger, cookies map[string]string, render EmojiRenderer) (*PairResult, error) {
+	if err := layout.EnsureDirs(); err != nil {
+		return nil, err
+	}
+	if len(cookies) == 0 {
+		return nil, errors.New("Google Account cookies are required")
+	}
+	auth := libgm.NewAuthData()
+	auth.SetCookies(cookies)
+	cli := libgm.NewClient(auth, nil, logger)
+	defer cli.Disconnect()
+
+	if err := cli.FetchConfig(ctx); err != nil {
+		return nil, fmt.Errorf("fetch Google Messages account config: %w", err)
+	}
+	emoji, session, err := cli.StartGaiaPairing(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("start Google Account pairing: %w", err)
+	}
+	render(emoji)
+
+	pairCtx, cancel := context.WithTimeout(ctx, PairTimeout)
+	defer cancel()
+	phoneID, err := cli.FinishGaiaPairing(pairCtx, session)
+	if err != nil {
+		return nil, fmt.Errorf("finish Google Account pairing: %w", err)
+	}
+	if err := saveAuth(layout.Session, auth); err != nil {
+		return nil, fmt.Errorf("persist session: %w", err)
+	}
+	return &PairResult{PhoneID: phoneID, SessionPath: layout.Session}, nil
 }
 
 func loadAuth(path string) (*libgm.AuthData, error) {

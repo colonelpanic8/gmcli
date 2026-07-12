@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -35,6 +36,13 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping sqlite %s: %w", path, err)
+	}
+	// The archive contains private message content. SQLite honors the process
+	// umask when creating it, but explicitly enforce owner-only access for both
+	// new databases and archives created by older gmcli versions.
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("secure sqlite %s: %w", path, err)
 	}
 	s := &Store{db: db}
 	if err := s.migrate(ctx); err != nil {

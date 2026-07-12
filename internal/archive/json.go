@@ -57,6 +57,32 @@ type message struct {
 	ReplyToID      *string    `json:"reply_to_id,omitempty"`
 }
 
+const conversationsQuery = `
+	SELECT conversation_id, source_platform, name, is_group, participants_json,
+	       last_message_ts, unread, pinned, archived, updated_at
+	  FROM conversations
+	 ORDER BY last_message_ts, conversation_id`
+
+const messagesQuery = `
+	SELECT message_id, conversation_id, source_platform, sender_id, body,
+	       timestamp_ms, status, is_from_me, media_id, mime_type,
+	       reactions_json, reply_to_id
+	  FROM messages
+	 ORDER BY timestamp_ms, message_id`
+
+const contactsQuery = `
+	SELECT c.participant_id, c.source_platform, c.contact_id, c.name, c.e164,
+	       c.formatted_number, c.avatar_color, c.is_me,
+	       COALESCE(a.alias, '')
+	  FROM contacts c
+	  LEFT JOIN aliases a ON a.target_type = 'contact' AND a.target_id = c.participant_id
+	 ORDER BY c.participant_id`
+
+const aliasesQuery = `
+	SELECT target_type, target_id, alias, updated_at
+	  FROM aliases
+	 ORDER BY target_type, target_id`
+
 // WriteJSON writes a consistent, portable snapshot to path. The destination
 // is replaced only after the full JSON document has been written successfully.
 func WriteJSON(ctx context.Context, st *store.Store, path string, force bool) (Result, error) {
@@ -193,95 +219,85 @@ func writeArray[T any](w *bufio.Writer, name string, rows *sql.Rows, scan func(*
 }
 
 func writeConversations(ctx context.Context, tx *sql.Tx, w *bufio.Writer) (int, error) {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT conversation_id, source_platform, name, is_group, participants_json,
-		       last_message_ts, unread, pinned, archived, updated_at
-		  FROM conversations
-		 ORDER BY last_message_ts, conversation_id`)
+	rows, err := tx.QueryContext(ctx, conversationsQuery)
 	if err != nil {
 		return 0, fmt.Errorf("query conversations: %w", err)
 	}
-	return writeArray(w, "conversations", rows, func(r *sql.Rows) (conversation, error) {
-		var c conversation
-		var isGroup, unread, pinned, archived, updated int64
-		var participants string
-		err := r.Scan(&c.ID, &c.SourcePlatform, &c.Name, &isGroup, &participants,
-			&c.LastMessageTimeMS, &unread, &pinned, &archived, &updated)
-		c.IsGroup, c.Unread, c.Pinned, c.Archived = isGroup != 0, unread != 0, pinned != 0, archived != 0
-		c.UpdatedAt = time.UnixMilli(updated).UTC()
-		c.Participants = jsonValue(participants)
-		return c, err
-	})
+	return writeArray(w, "conversations", rows, scanConversation)
 }
 
 func writeMessages(ctx context.Context, tx *sql.Tx, w *bufio.Writer) (int, error) {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT message_id, conversation_id, source_platform, sender_id, body,
-		       timestamp_ms, status, is_from_me, media_id, mime_type,
-		       reactions_json, reply_to_id
-		  FROM messages
-		 ORDER BY timestamp_ms, message_id`)
+	rows, err := tx.QueryContext(ctx, messagesQuery)
 	if err != nil {
 		return 0, fmt.Errorf("query messages: %w", err)
 	}
-	return writeArray(w, "messages", rows, func(r *sql.Rows) (message, error) {
-		var m message
-		var body, mediaID, mimeType, reactions, replyTo sql.NullString
-		var fromMe int64
-		err := r.Scan(&m.ID, &m.ConversationID, &m.SourcePlatform, &m.SenderID, &body,
-			&m.TimestampMS, &m.Status, &fromMe, &mediaID, &mimeType, &reactions, &replyTo)
-		m.IsFromMe = fromMe != 0
-		m.Body, m.MediaID, m.MimeType, m.ReplyToID = stringPtr(body), stringPtr(mediaID), stringPtr(mimeType), stringPtr(replyTo)
-		if reactions.Valid {
-			value := jsonValue(reactions.String)
-			m.Reactions = &value
-		}
-		return m, err
-	})
+	return writeArray(w, "messages", rows, scanMessage)
 }
 
 func writeContacts(ctx context.Context, tx *sql.Tx, w *bufio.Writer) (int, error) {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT c.participant_id, c.source_platform, c.contact_id, c.name, c.e164,
-		       c.formatted_number, c.avatar_color, c.is_me,
-		       COALESCE(a.alias, '')
-		  FROM contacts c
-		  LEFT JOIN aliases a ON a.target_type = 'contact' AND a.target_id = c.participant_id
-		 ORDER BY c.participant_id`)
+	rows, err := tx.QueryContext(ctx, contactsQuery)
 	if err != nil {
 		return 0, fmt.Errorf("query contacts: %w", err)
 	}
-	return writeArray(w, "contacts", rows, func(r *sql.Rows) (store.Contact, error) {
-		var c store.Contact
-		var isMe int64
-		err := r.Scan(&c.ParticipantID, &c.SourcePlatform, &c.ContactID, &c.Name, &c.E164,
-			&c.FormattedNumber, &c.AvatarColor, &isMe, &c.Alias)
-		c.IsMe = isMe != 0
-		c.DisplayName = c.Name
-		if c.Alias != "" {
-			c.DisplayName = c.Alias
-		}
-		return c, err
-	})
+	return writeArray(w, "contacts", rows, scanContact)
 }
 
 func writeAliases(ctx context.Context, tx *sql.Tx, w *bufio.Writer) (int, error) {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT target_type, target_id, alias, updated_at
-		  FROM aliases
-		 ORDER BY target_type, target_id`)
+	rows, err := tx.QueryContext(ctx, aliasesQuery)
 	if err != nil {
 		return 0, fmt.Errorf("query aliases: %w", err)
 	}
-	return writeArray(w, "aliases", rows, func(r *sql.Rows) (store.Alias, error) {
-		var a store.Alias
-		var target string
-		var updated int64
-		err := r.Scan(&target, &a.TargetID, &a.Alias, &updated)
-		a.TargetType = store.AliasTarget(target)
-		a.UpdatedAt = time.UnixMilli(updated).UTC()
-		return a, err
-	})
+	return writeArray(w, "aliases", rows, scanAlias)
+}
+
+func scanConversation(r *sql.Rows) (conversation, error) {
+	var c conversation
+	var isGroup, unread, pinned, archived, updated int64
+	var participants string
+	err := r.Scan(&c.ID, &c.SourcePlatform, &c.Name, &isGroup, &participants,
+		&c.LastMessageTimeMS, &unread, &pinned, &archived, &updated)
+	c.IsGroup, c.Unread, c.Pinned, c.Archived = isGroup != 0, unread != 0, pinned != 0, archived != 0
+	c.UpdatedAt = time.UnixMilli(updated).UTC()
+	c.Participants = jsonValue(participants)
+	return c, err
+}
+
+func scanMessage(r *sql.Rows) (message, error) {
+	var m message
+	var body, mediaID, mimeType, reactions, replyTo sql.NullString
+	var fromMe int64
+	err := r.Scan(&m.ID, &m.ConversationID, &m.SourcePlatform, &m.SenderID, &body,
+		&m.TimestampMS, &m.Status, &fromMe, &mediaID, &mimeType, &reactions, &replyTo)
+	m.IsFromMe = fromMe != 0
+	m.Body, m.MediaID, m.MimeType, m.ReplyToID = stringPtr(body), stringPtr(mediaID), stringPtr(mimeType), stringPtr(replyTo)
+	if reactions.Valid {
+		value := jsonValue(reactions.String)
+		m.Reactions = &value
+	}
+	return m, err
+}
+
+func scanContact(r *sql.Rows) (store.Contact, error) {
+	var c store.Contact
+	var isMe int64
+	err := r.Scan(&c.ParticipantID, &c.SourcePlatform, &c.ContactID, &c.Name, &c.E164,
+		&c.FormattedNumber, &c.AvatarColor, &isMe, &c.Alias)
+	c.IsMe = isMe != 0
+	c.DisplayName = c.Name
+	if c.Alias != "" {
+		c.DisplayName = c.Alias
+	}
+	return c, err
+}
+
+func scanAlias(r *sql.Rows) (store.Alias, error) {
+	var a store.Alias
+	var target string
+	var updated int64
+	err := r.Scan(&target, &a.TargetID, &a.Alias, &updated)
+	a.TargetType = store.AliasTarget(target)
+	a.UpdatedAt = time.UnixMilli(updated).UTC()
+	return a, err
 }
 
 func stringPtr(value sql.NullString) *string {

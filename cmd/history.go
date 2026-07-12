@@ -25,6 +25,21 @@ type historyBackfillResult struct {
 	MessagesAddedForChat int    `json:"messages_added_for_chat"`
 }
 
+type historyBackfillError struct {
+	ConversationID string `json:"conversation_id"`
+	Error          string `json:"error"`
+}
+
+type historyBackfillAllResult struct {
+	Conversations   int                     `json:"conversations"`
+	Completed       int                     `json:"completed"`
+	Failed          int                     `json:"failed"`
+	FetchedMessages int                     `json:"fetched_messages"`
+	MessagesAdded   int                     `json:"messages_added"`
+	Results         []historyBackfillResult `json:"results"`
+	Errors          []historyBackfillError  `json:"errors,omitempty"`
+}
+
 func historyCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "history",
@@ -33,7 +48,39 @@ func historyCmd() *cobra.Command {
 			"Like wacli, this is best-effort: Google may return partial history, " +
 			"and the phone must be online.",
 	}
-	c.AddCommand(historyBackfillCmd())
+	c.AddCommand(historyBackfillCmd(), historyBackfillAllCmd())
+	return c
+}
+
+func historyBackfillAllCmd() *cobra.Command {
+	var requests int
+	var count int64
+	c := &cobra.Command{
+		Use:   "backfill-all",
+		Short: "Fetch older messages for every locally known conversation",
+		Long: "Fetch older messages for every locally known conversation over one connection. " +
+			"Failures are recorded per conversation so the remaining archive can continue.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if requests <= 0 {
+				requests = 10
+			}
+			if count <= 0 {
+				count = 50
+			}
+			res, err := runHistoryBackfillAll(requests, count)
+			if err != nil {
+				return err
+			}
+			if flags.jsonOut {
+				return output.JSON(os.Stdout, res)
+			}
+			fmt.Fprintf(os.Stderr, "Backfilled %d/%d conversation(s): fetched %d message record(s), added %d local message(s); %d failed\n",
+				res.Completed, res.Conversations, res.FetchedMessages, res.MessagesAdded, res.Failed)
+			return nil
+		},
+	}
+	c.Flags().IntVar(&requests, "requests", 10, "max FetchMessages calls to make per conversation")
+	c.Flags().Int64Var(&count, "count", 50, "max message records to request per FetchMessages call")
 	return c
 }
 
@@ -104,6 +151,69 @@ func runHistoryBackfill(chat string, requests int, count int64) (historyBackfill
 	}
 	defer client.Disconnect()
 
+	return runHistoryBackfillConnected(ctx, st, client, pump, chat, requests, count)
+}
+
+func runHistoryBackfillAll(requests int, count int64) (historyBackfillAllResult, error) {
+	layout, err := resolveLayout()
+	if err != nil {
+		return historyBackfillAllResult{}, err
+	}
+	logger := newLogger()
+	ctx, cancel := signalContext(context.Background())
+	defer cancel()
+
+	st, err := store.Open(ctx, layout.Database)
+	if err != nil {
+		return historyBackfillAllResult{}, fmt.Errorf("open store: %w", err)
+	}
+	defer st.Close()
+
+	total, err := st.CountConversations(ctx)
+	if err != nil {
+		return historyBackfillAllResult{}, fmt.Errorf("count conversations: %w", err)
+	}
+	conversations, err := st.ListConversations(ctx, store.ListConversationOpts{Limit: total})
+	if err != nil {
+		return historyBackfillAllResult{}, err
+	}
+	result := historyBackfillAllResult{
+		Conversations: len(conversations),
+		Results:       make([]historyBackfillResult, 0, len(conversations)),
+	}
+	if len(conversations) == 0 {
+		return result, nil
+	}
+
+	client, err := gm.Open(layout, logger)
+	if err != nil {
+		return result, err
+	}
+	pump := gmsync.New(st, logger)
+	client.Subscribe(pump.Handle)
+	if err := client.Connect(); err != nil {
+		return result, fmt.Errorf("connect: %w", err)
+	}
+	defer client.Disconnect()
+
+	for i, conversation := range conversations {
+		fmt.Fprintf(os.Stderr, "Backfilling conversation %d/%d (%s)\n", i+1, len(conversations), conversation.ID)
+		res, err := runHistoryBackfillConnected(ctx, st, client, pump, conversation.ID, requests, count)
+		if err != nil {
+			result.Failed++
+			result.Errors = append(result.Errors, historyBackfillError{ConversationID: conversation.ID, Error: err.Error()})
+			fmt.Fprintf(os.Stderr, "Backfill failed for %s: %v\n", conversation.ID, err)
+			continue
+		}
+		result.Completed++
+		result.FetchedMessages += res.FetchedMessages
+		result.MessagesAdded += res.MessagesAddedForChat
+		result.Results = append(result.Results, res)
+	}
+	return result, nil
+}
+
+func runHistoryBackfillConnected(ctx context.Context, st *store.Store, client *gm.Client, pump *gmsync.Pump, chat string, requests int, count int64) (historyBackfillResult, error) {
 	if conv, err := client.Underlying().GetConversation(chat); err == nil && conv != nil {
 		pump.Handle(conv)
 	} else if _, localErr := st.GetConversation(ctx, chat); localErr != nil {

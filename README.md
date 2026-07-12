@@ -92,11 +92,14 @@ initial beta releases.
 ## Quick start
 
 ```sh
-# 1. One-time pairing (renders a QR code in the terminal — scan with the
-#    Google Messages app on your phone, Settings → Device pairing → QR code).
-gmcli auth
+# 1. One-time Google Account pairing. Export the required
+#    messages.google.com cookies to a mode-0600 JSON file, then run:
+gmcli auth --method google --cookies-file /path/to/google-messages-cookies.json
+#    Tap the displayed emoji in the Google Messages prompt on your phone.
+#    To use legacy QR pairing where it is still supported:
+gmcli auth --method qr
 # In remote/sandboxed terminals, write a scan-friendly PNG instead:
-gmcli auth --qr-png /tmp/gmcli-pair-qr.png
+gmcli auth --method qr --qr-png /tmp/gmcli-pair-qr.png
 
 # 2. Sync messages from the phone into the local database. --follow keeps
 #    the connection open and writes new messages as they arrive.
@@ -146,6 +149,17 @@ gmcli media download --message <msg-id>
 gmcli --json chats list | jq '.[0].name'
 ```
 
+For a streamable backup, export the archive as segmented JSONL. The output
+directory contains `conversations.jsonl`, `contacts.jsonl`, `aliases.jsonl`,
+one `messages/*.jsonl` file per conversation, and a manifest mapping each
+conversation ID to its file, record count, and SHA-256 checksum. The directory
+and files use private permissions:
+
+```sh
+gmcli export jsonl --out ~/Backups/gmcli/latest --force
+gmcli export verify --dir ~/Backups/gmcli/latest
+```
+
 ## Global flags
 
 | Flag             | Default                            | Purpose                                                  |
@@ -192,9 +206,11 @@ by default.
 - Media attachments are referenced by ID in the database; bytes are not
   downloaded by default. Use `gmcli media download --message <message-id>`
   for explicit downloads.
-- `gmcli export json` writes message and contact data with mode 0600 and omits
-  media decryption keys and raw protocol buffers. It does not embed downloaded
-  media files. Protect exported files as carefully as the SQLite database.
+- `gmcli export json` and `gmcli export jsonl` write message and contact data
+  with private permissions and omit media decryption keys and raw protocol
+  buffers. They do not embed downloaded media files. Protect exported files as
+  carefully as the SQLite database, and use `gmcli export verify` to detect a
+  truncated or corrupted segmented archive.
 - The SQLite file is unencrypted. If you need at-rest encryption, layer your
   own filesystem encryption (FileVault, LUKS, etc.).
 

@@ -1,9 +1,12 @@
 package cmd_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +14,7 @@ import (
 	"time"
 
 	"github.com/fdsouvenir/gmcli/cmd"
+	"github.com/fdsouvenir/gmcli/internal/archive"
 	"github.com/fdsouvenir/gmcli/internal/store"
 )
 
@@ -281,5 +285,128 @@ func TestExportJSON(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("export mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestExportJSONL(t *testing.T) {
+	dir := seedStore(t)
+	out := filepath.Join(t.TempDir(), "archive-jsonl")
+	resultJSON := runCmd(t, dir, "--json", "export", "jsonl", "--out", out)
+
+	var result struct {
+		Format        string `json:"format"`
+		Conversations int    `json:"conversations"`
+		Messages      int    `json:"messages"`
+		Contacts      int    `json:"contacts"`
+		Aliases       int    `json:"aliases"`
+	}
+	if err := json.Unmarshal([]byte(resultJSON), &result); err != nil {
+		t.Fatalf("result json: %v\n%s", err, resultJSON)
+	}
+	if result.Format != "gmcli-jsonl-archive" || result.Conversations != 2 || result.Messages != 5 || result.Contacts != 3 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+
+	validateFile := func(name string, wantLines int, wantSHA, conversationID string) {
+		t.Helper()
+		path := filepath.Join(out, filepath.FromSlash(name))
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if got := fmt.Sprintf("%x", sha256.Sum256(data)); got != wantSHA {
+			t.Fatalf("%s checksum = %s, want %s", name, got, wantSHA)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("open %s: %v", name, err)
+		}
+		scanner := bufio.NewScanner(f)
+		lines := 0
+		for scanner.Scan() {
+			var value map[string]any
+			if err := json.Unmarshal(scanner.Bytes(), &value); err != nil {
+				f.Close()
+				t.Fatalf("invalid JSON on %s line %d: %v", name, lines+1, err)
+			}
+			if conversationID != "" && value["conversation_id"] != conversationID {
+				f.Close()
+				t.Fatalf("%s line %d conversation_id = %#v, want %q", name, lines+1, value["conversation_id"], conversationID)
+			}
+			lines++
+		}
+		if err := scanner.Err(); err != nil {
+			f.Close()
+			t.Fatalf("scan %s: %v", name, err)
+		}
+		f.Close()
+		if lines != wantLines {
+			t.Fatalf("%s has %d lines, want %d", name, lines, wantLines)
+		}
+		info, err := os.Stat(path)
+		if err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("%s mode = %v err=%v, want 0600", name, info.Mode().Perm(), err)
+		}
+	}
+
+	manifestData, err := os.ReadFile(filepath.Join(out, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var manifest struct {
+		Format string `json:"format"`
+		Files  map[string]struct {
+			Path    string `json:"path"`
+			Records int    `json:"records"`
+			SHA256  string `json:"sha256"`
+		} `json:"files"`
+		ConversationMessages []struct {
+			ConversationID string `json:"conversation_id"`
+			Path           string `json:"path"`
+			Messages       int    `json:"messages"`
+			SHA256         string `json:"sha256"`
+		} `json:"conversation_messages"`
+	}
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		t.Fatalf("manifest json: %v", err)
+	}
+	if manifest.Format != result.Format || len(manifest.ConversationMessages) != result.Conversations {
+		t.Fatalf("unexpected manifest: %+v", manifest)
+	}
+	for _, name := range []string{"conversations", "contacts", "aliases"} {
+		file := manifest.Files[name]
+		validateFile(file.Path, file.Records, file.SHA256, "")
+	}
+	totalMessages := 0
+	for _, file := range manifest.ConversationMessages {
+		validateFile(file.Path, file.Messages, file.SHA256, file.ConversationID)
+		totalMessages += file.Messages
+	}
+	if totalMessages != result.Messages {
+		t.Fatalf("conversation files contain %d messages, want %d", totalMessages, result.Messages)
+	}
+	verifiedJSON := runCmd(t, dir, "--json", "export", "verify", "--dir", out)
+	var verified struct {
+		Messages int `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(verifiedJSON), &verified); err != nil || verified.Messages != result.Messages {
+		t.Fatalf("unexpected verification result: %s err=%v", verifiedJSON, err)
+	}
+	info, err := os.Stat(out)
+	if err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("archive directory mode = %v err=%v, want 0700", info.Mode().Perm(), err)
+	}
+
+	corruptPath := filepath.Join(out, filepath.FromSlash(manifest.ConversationMessages[0].Path))
+	f, err := os.OpenFile(corruptPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open message file for corruption test: %v", err)
+	}
+	if _, err := f.WriteString("{not-json}\n"); err != nil {
+		t.Fatalf("corrupt message file: %v", err)
+	}
+	f.Close()
+	if _, err := archive.VerifyJSONL(out); err == nil {
+		t.Fatal("verification unexpectedly accepted a corrupt message file")
 	}
 }

@@ -19,9 +19,13 @@ import (
 
 const syncHeartbeatInterval = 5 * time.Minute
 const sendSettingsRefreshTimeout = 60 * time.Second
-const defaultConversationDiscoveryLimit = 10_000
+const defaultConversationPageSize = 100
 const conversationFolderTimeout = 90 * time.Second
-const maxConversationPages = 100
+
+// Keep a finite guard against a relay that cycles through distinct cursors. At
+// the default page size this retains the previous one-million-conversation
+// discovery capacity while avoiding oversized individual relay requests.
+const maxConversationPages = 10_000
 
 type conversationListClient interface {
 	ListConversationsWithCursor(int, gmproto.ListConversationsRequest_Folder, *gmproto.Cursor) (*gmproto.ListConversationsResponse, error)
@@ -223,7 +227,7 @@ func syncCmd() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&follow, "follow", false, "stay connected and stream events until interrupted")
-	c.Flags().IntVar(&conversationLimit, "conversation-limit", defaultConversationDiscoveryLimit, "max conversations to request from each folder")
+	c.Flags().IntVar(&conversationLimit, "conversation-limit", defaultConversationPageSize, "conversations to request per folder page")
 	c.Flags().BoolVar(&includeSpam, "include-spam", true, "discover conversations in Spam & blocked in addition to Inbox")
 	c.Flags().BoolVar(&includeArchive, "include-archive", true, "discover conversations in Archive in addition to Inbox")
 	c.AddCommand(syncSendSettingsCmd())

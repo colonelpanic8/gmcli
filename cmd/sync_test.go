@@ -70,9 +70,15 @@ func TestRunSendSettingsRefreshSuccess(t *testing.T) {
 type fakeConversationLister struct {
 	response *gmproto.ListConversationsResponse
 	wait     <-chan struct{}
+	count    int
+	folder   gmproto.ListConversationsRequest_Folder
+	cursor   *gmproto.Cursor
 }
 
-func (f fakeConversationLister) ListConversationsWithCursor(_ int, _ gmproto.ListConversationsRequest_Folder, _ *gmproto.Cursor) (*gmproto.ListConversationsResponse, error) {
+func (f *fakeConversationLister) ListConversationsWithCursor(count int, folder gmproto.ListConversationsRequest_Folder, cursor *gmproto.Cursor) (*gmproto.ListConversationsResponse, error) {
+	f.count = count
+	f.folder = folder
+	f.cursor = cursor
 	if f.wait != nil {
 		<-f.wait
 	}
@@ -81,21 +87,45 @@ func (f fakeConversationLister) ListConversationsWithCursor(_ int, _ gmproto.Lis
 
 func TestListConversationPage(t *testing.T) {
 	want := &gmproto.ListConversationsResponse{Conversations: []*gmproto.Conversation{{ConversationID: "conv-1"}}}
-	got, err := listConversationPage(context.Background(), fakeConversationLister{response: want}, 50, gmproto.ListConversationsRequest_INBOX, nil, time.Second)
+	wantCursor := &gmproto.Cursor{}
+	lister := &fakeConversationLister{response: want}
+	got, err := listConversationPage(context.Background(), lister, 100, gmproto.ListConversationsRequest_ARCHIVE, wantCursor, time.Second)
 	if err != nil {
 		t.Fatalf("list page: %v", err)
 	}
 	if got.GetConversations()[0].GetConversationID() != "conv-1" {
 		t.Fatalf("unexpected response: %+v", got)
 	}
+	if lister.count != 100 {
+		t.Fatalf("count: got %d want 100", lister.count)
+	}
+	if lister.folder != gmproto.ListConversationsRequest_ARCHIVE {
+		t.Fatalf("folder: got %s want ARCHIVE", lister.folder)
+	}
+	if lister.cursor != wantCursor {
+		t.Fatalf("cursor was not forwarded")
+	}
 }
 
 func TestListConversationPageTimeout(t *testing.T) {
 	wait := make(chan struct{})
-	_, err := listConversationPage(context.Background(), fakeConversationLister{wait: wait}, 50, gmproto.ListConversationsRequest_ARCHIVE, nil, time.Millisecond)
+	_, err := listConversationPage(context.Background(), &fakeConversationLister{wait: wait}, 50, gmproto.ListConversationsRequest_ARCHIVE, nil, time.Millisecond)
 	close(wait)
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("expected timeout, got %v", err)
+	}
+}
+
+func TestSyncConversationLimitDefaultsToSafePageSize(t *testing.T) {
+	flag := syncCmd().Flags().Lookup("conversation-limit")
+	if flag == nil {
+		t.Fatal("conversation-limit flag is missing")
+	}
+	if flag.DefValue != "100" {
+		t.Fatalf("default conversation page size: got %s want 100", flag.DefValue)
+	}
+	if !strings.Contains(flag.Usage, "per folder page") {
+		t.Fatalf("conversation-limit usage does not describe per-page semantics: %q", flag.Usage)
 	}
 }
 

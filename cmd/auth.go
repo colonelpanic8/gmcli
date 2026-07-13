@@ -83,7 +83,37 @@ func authCmd() *cobra.Command {
 	c.Flags().StringVar(&method, "method", "google", "pairing method: google or qr")
 	c.Flags().StringVar(&cookiesFile, "cookies-file", "", "Google cookie JSON file; use - to read from stdin (required for --method google)")
 	c.Flags().StringVar(&qrPNG, "qr-png", "", "write pairing QR code to a PNG file")
-	c.AddCommand(authRefreshWebStorageCmd())
+	c.AddCommand(authRefreshCookiesCmd(), authRefreshWebStorageCmd())
+	return c
+}
+
+func authRefreshCookiesCmd() *cobra.Command {
+	var cookiesFile string
+	c := &cobra.Command{
+		Use:   "refresh-cookies",
+		Short: "Refresh rotating Google Account cookies without re-pairing",
+		Long: "Replace a paired Google Account session's browser cookies from a JSON object. " +
+			"The candidate cookies are validated with Google before session.json is replaced atomically.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cookies, err := readGoogleCookies(cookiesFile, os.Stdin)
+			if err != nil {
+				return err
+			}
+			layout, err := resolveLayout()
+			if err != nil {
+				return err
+			}
+			ctx, cancel := signalContext(context.Background())
+			defer cancel()
+			if err := gm.RefreshGoogleCookies(ctx, layout, newLogger(), cookies); err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "Refreshed Google Account cookies: %s\n", layout.Session)
+			return nil
+		},
+	}
+	c.Flags().StringVar(&cookiesFile, "cookies-file", "", "Google cookie JSON file; use - to read from stdin")
 	return c
 }
 

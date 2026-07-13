@@ -96,6 +96,9 @@ initial beta releases.
 #    messages.google.com cookies to a mode-0600 JSON file, then run:
 gmcli auth --method google --cookies-file /path/to/google-messages-cookies.json
 #    Tap the displayed emoji in the Google Messages prompt on your phone.
+#    Google may rotate those account cookies later. Refresh them without
+#    repeating phone pairing, after exporting the current cookie set:
+gmcli auth refresh-cookies --cookies-file /path/to/google-messages-cookies.json
 #    To use legacy QR pairing where it is still supported:
 gmcli auth --method qr
 # In remote/sandboxed terminals, write a scan-friendly PNG instead:

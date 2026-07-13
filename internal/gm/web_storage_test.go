@@ -74,6 +74,62 @@ func TestCloseSurfacesPersistenceFailure(t *testing.T) {
 	}
 }
 
+func TestRefreshGoogleCookiesValidatesBeforeSaving(t *testing.T) {
+	layout := paths.Layout{Session: filepath.Join(t.TempDir(), "session.json")}
+	auth := libgm.NewAuthData()
+	auth.Browser = &gmproto.Device{UserID: 16, SourceID: "browser", Network: "GDitto"}
+	auth.SetCookies(map[string]string{"SID": "old", "OSID": "old"})
+	if err := saveAuth(layout.Session, auth); err != nil {
+		t.Fatal(err)
+	}
+
+	err := refreshGoogleCookies(layout, map[string]string{"SID": "new", "OSID": "new"}, func(candidate *libgm.AuthData) error {
+		if candidate.Cookies["SID"] != "new" || candidate.Cookies["OSID"] != "new" {
+			t.Fatalf("validator received wrong cookies: %#v", candidate.Cookies)
+		}
+		candidate.Cookies["response-rotated"] = "kept"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("refreshGoogleCookies: %v", err)
+	}
+	got, err := loadAuth(layout.Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cookies["SID"] != "new" || got.Cookies["response-rotated"] != "kept" {
+		t.Fatalf("refreshed cookies were not persisted: %#v", got.Cookies)
+	}
+}
+
+func TestRefreshGoogleCookiesRejectsInvalidCandidateWithoutChangingSession(t *testing.T) {
+	layout := paths.Layout{Session: filepath.Join(t.TempDir(), "session.json")}
+	auth := libgm.NewAuthData()
+	auth.Browser = &gmproto.Device{UserID: 16, SourceID: "browser", Network: "GDitto"}
+	auth.SetCookies(map[string]string{"SID": "old"})
+	if err := saveAuth(layout.Session, auth); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(layout.Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = refreshGoogleCookies(layout, map[string]string{"SID": "bad"}, func(*libgm.AuthData) error {
+		return errors.New("rejected")
+	})
+	if err == nil || !strings.Contains(err.Error(), "validate refreshed Google Account cookies") {
+		t.Fatalf("unexpected refresh error: %v", err)
+	}
+	after, err := os.ReadFile(layout.Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("failed validation changed session.json")
+	}
+}
+
 func TestRefreshSessionFromWebStorageValidatesBeforeSaving(t *testing.T) {
 	layout, values := webStorageFixture(t)
 	now := time.Now().UTC()

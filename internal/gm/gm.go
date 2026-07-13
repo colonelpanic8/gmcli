@@ -766,6 +766,47 @@ func PairGoogle(ctx context.Context, layout paths.Layout, logger zerolog.Logger,
 	return &PairResult{PhoneID: phoneID, SessionPath: layout.Session}, nil
 }
 
+// RefreshGoogleCookies replaces the rotating Google Account browser cookies
+// in an existing paired session. The detached candidate must successfully
+// fetch Google's account configuration before it can replace session.json.
+func RefreshGoogleCookies(ctx context.Context, layout paths.Layout, logger zerolog.Logger, cookies map[string]string) error {
+	return refreshGoogleCookies(layout, cookies, func(candidate *libgm.AuthData) error {
+		client := libgm.NewClient(candidate, nil, logger)
+		defer client.Disconnect()
+		if err := client.FetchConfig(ctx); err != nil {
+			return fmt.Errorf("fetch Google Messages account config: %w", err)
+		}
+		return nil
+	})
+}
+
+type googleCookieValidator func(*libgm.AuthData) error
+
+func refreshGoogleCookies(layout paths.Layout, cookies map[string]string, validate googleCookieValidator) error {
+	if len(cookies) == 0 {
+		return errors.New("Google Account cookies are required")
+	}
+	existing, err := loadAuth(layout.Session)
+	if err != nil {
+		return err
+	}
+	candidate, err := cloneAuthData(existing)
+	if err != nil {
+		return fmt.Errorf("copy existing session: %w", err)
+	}
+	candidate.SetCookies(cookies)
+	if validate == nil {
+		return errors.New("Google Account cookie validator is required")
+	}
+	if err := validate(candidate); err != nil {
+		return fmt.Errorf("validate refreshed Google Account cookies: %w", err)
+	}
+	if err := saveAuth(layout.Session, candidate); err != nil {
+		return fmt.Errorf("persist validated Google Account cookies: %w", err)
+	}
+	return nil
+}
+
 func loadAuth(path string) (*libgm.AuthData, error) {
 	f, err := os.Open(path)
 	if err != nil {

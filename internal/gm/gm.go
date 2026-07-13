@@ -117,12 +117,28 @@ func (c *Client) Connect() error {
 	return c.libgm.Connect()
 }
 
-// Disconnect closes the long-poll. Safe to call multiple times.
+// Disconnect closes the long-poll and persists the final in-memory auth
+// state. Safe to call multiple times. Call Close directly when the caller can
+// surface a persistence error.
 func (c *Client) Disconnect() {
+	if err := c.Close(); err != nil {
+		c.logger.Error().Err(err).Msg("Failed to persist auth data while disconnecting")
+	}
+}
+
+// Close closes the long-poll and persists the final in-memory auth state.
+// libgm updates Google Account cookies from HTTP responses without emitting an
+// auth-refresh event, so saving at a clean command boundary is necessary for
+// those rotated cookies to survive the next process start.
+func (c *Client) Close() error {
 	c.libgm.Disconnect()
 	c.mu.Lock()
 	c.ready = false
 	c.mu.Unlock()
+	if err := saveAuth(c.layout.Session, c.auth); err != nil {
+		return fmt.Errorf("persist auth data while disconnecting: %w", err)
+	}
+	return nil
 }
 
 // IsConnected reports whether the long-poll is currently active.
@@ -612,15 +628,7 @@ func (c *Client) DownloadMedia(mediaID string, key []byte) ([]byte, error) {
 // AuthSnapshot returns a deep copy of the current AuthData by JSON
 // round-trip. Useful for diagnostics; do not modify.
 func (c *Client) AuthSnapshot() (*libgm.AuthData, error) {
-	b, err := json.Marshal(c.auth)
-	if err != nil {
-		return nil, err
-	}
-	var out libgm.AuthData
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return cloneAuthData(c.auth)
 }
 
 // dispatch is the single libgm callback. It persists on token refresh and
@@ -775,6 +783,12 @@ func loadAuth(path string) (*libgm.AuthData, error) {
 }
 
 func saveAuth(path string, auth *libgm.AuthData) error {
+	data, err := marshalAuthData(auth, true)
+	if err != nil {
+		return fmt.Errorf("encode session: %w", err)
+	}
+	data = append(data, '\n')
+
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -786,11 +800,9 @@ func saveAuth(path string, auth *libgm.AuthData) error {
 		_ = f.Close()
 		return fmt.Errorf("secure temporary session %s: %w", tmp, err)
 	}
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(auth); err != nil {
+	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
-		return fmt.Errorf("encode session: %w", err)
+		return fmt.Errorf("write session: %w", err)
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
@@ -943,7 +955,7 @@ func applyWebStorageSession(existing *libgm.AuthData, values map[string]string, 
 }
 
 func cloneAuthData(auth *libgm.AuthData) (*libgm.AuthData, error) {
-	data, err := json.Marshal(auth)
+	data, err := marshalAuthData(auth, false)
 	if err != nil {
 		return nil, err
 	}
@@ -952,6 +964,22 @@ func cloneAuthData(auth *libgm.AuthData) (*libgm.AuthData, error) {
 		return nil, err
 	}
 	return &cloned, nil
+}
+
+// marshalAuthData serializes AuthData while holding libgm's cookie lock.
+// libgm may replace response cookies from its long-poll goroutine while gmcli
+// is persisting the session; encoding the map without the lock is a data race
+// and can produce an inconsistent snapshot (or panic on concurrent writes).
+func marshalAuthData(auth *libgm.AuthData, indent bool) ([]byte, error) {
+	if auth == nil {
+		return nil, errors.New("auth data is nil")
+	}
+	auth.CookiesLock.RLock()
+	defer auth.CookiesLock.RUnlock()
+	if indent {
+		return json.MarshalIndent(auth, "", "  ")
+	}
+	return json.Marshal(auth)
 }
 
 func validateAndRefreshWebStorageSession(auth *libgm.AuthData) error {

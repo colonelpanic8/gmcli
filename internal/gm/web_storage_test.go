@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	gmcrypto "go.mau.fi/mautrix-gmessages/pkg/libgm/crypto"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
@@ -18,6 +20,59 @@ import (
 
 	"github.com/fdsouvenir/gmcli/internal/paths"
 )
+
+func TestClosePersistsResponseRotatedCookies(t *testing.T) {
+	layout := paths.Layout{Session: filepath.Join(t.TempDir(), "session.json")}
+	auth := libgm.NewAuthData()
+	auth.Browser = &gmproto.Device{UserID: 16, SourceID: "browser", Network: "GDitto"}
+	auth.SetCookies(map[string]string{"OSID": "before", "SID": "stable"})
+	if err := saveAuth(layout.Session, auth); err != nil {
+		t.Fatalf("save initial auth: %v", err)
+	}
+
+	client, err := Open(layout, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("open client: %v", err)
+	}
+	response := &http.Response{Header: make(http.Header)}
+	response.Header.Add("Set-Cookie", "OSID=after; Path=/; Secure; HttpOnly")
+	client.auth.UpdateCookiesFromResponse(response)
+	if err := client.Close(); err != nil {
+		t.Fatalf("close client: %v", err)
+	}
+
+	reloaded, err := loadAuth(layout.Session)
+	if err != nil {
+		t.Fatalf("reload auth: %v", err)
+	}
+	if got := reloaded.Cookies["OSID"]; got != "after" {
+		t.Fatalf("rotated cookie = %q, want %q", got, "after")
+	}
+	if got := reloaded.Cookies["SID"]; got != "stable" {
+		t.Fatalf("stable cookie = %q, want %q", got, "stable")
+	}
+	info, err := os.Stat(layout.Session)
+	if err != nil {
+		t.Fatalf("stat session: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("session permissions = %04o, want 0600", got)
+	}
+}
+
+func TestCloseSurfacesPersistenceFailure(t *testing.T) {
+	auth := libgm.NewAuthData()
+	auth.Browser = &gmproto.Device{UserID: 16, SourceID: "browser", Network: "GDitto"}
+	client := &Client{
+		auth:   auth,
+		layout: paths.Layout{Session: filepath.Join(t.TempDir(), "missing", "session.json")},
+		logger: zerolog.Nop(),
+	}
+	client.libgm = libgm.NewClient(auth, nil, zerolog.Nop())
+	if err := client.Close(); err == nil || !strings.Contains(err.Error(), "persist auth data while disconnecting") {
+		t.Fatalf("close error = %v, want persistence error", err)
+	}
+}
 
 func TestRefreshSessionFromWebStorageValidatesBeforeSaving(t *testing.T) {
 	layout, values := webStorageFixture(t)

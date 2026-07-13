@@ -176,6 +176,7 @@ archive when a focused query will do.
    ```
    gmcli --json --read-only archive meta --dir '{archive_dir}'
    gmcli --json --read-only archive conversations --dir '{archive_dir}' --limit 200
+   gmcli --json --read-only archive conversations --dir '{archive_dir}' --sort messages --limit 200
    gmcli --json --read-only archive search '"{query}"' --dir '{archive_dir}' --limit 100
    gmcli --json --read-only archive messages {conversation_id} --dir '{archive_dir}' --limit 200
    gmcli --json --read-only archive context {conversation_id} {message_id} --dir '{archive_dir}' --before 5 --after 5

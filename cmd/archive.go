@@ -56,6 +56,7 @@ func archiveMetaCmd(options *archiveFlags) *cobra.Command {
 
 func archiveConversationsCmd(options *archiveFlags) *cobra.Command {
 	var limit, offset int
+	var sortOrder string
 	c := &cobra.Command{Use: "conversations [query]", Short: "List or filter archived conversations", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		archive, err := openArchive(cmd, options)
 		if err != nil {
@@ -66,7 +67,7 @@ func archiveConversationsCmd(options *archiveFlags) *cobra.Command {
 		if len(args) == 1 {
 			query = args[0]
 		}
-		page, err := archive.ListConversations(cmd.Context(), archiveview.ConversationQuery{Query: query, Limit: limit, Offset: offset})
+		page, err := archive.ListConversations(cmd.Context(), archiveview.ConversationQuery{Query: query, Sort: archiveview.ConversationSort(sortOrder), Limit: limit, Offset: offset})
 		if err != nil {
 			return err
 		}
@@ -89,6 +90,7 @@ func archiveConversationsCmd(options *archiveFlags) *cobra.Command {
 	}}
 	c.Flags().IntVar(&limit, "limit", 100, "max rows")
 	c.Flags().IntVar(&offset, "offset", 0, "rows to skip")
+	c.Flags().StringVar(&sortOrder, "sort", string(archiveview.ConversationSortRecent), "sort order: recent or messages")
 	return c
 }
 

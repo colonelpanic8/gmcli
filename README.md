@@ -171,6 +171,7 @@ gmcli coverage verify
 # manifest hashes. Pass --rebuild-cache to discard it completely.
 gmcli archive meta --dir ~/Backups/gmcli/latest
 gmcli archive conversations --dir ~/Backups/gmcli/latest
+gmcli archive conversations --dir ~/Backups/gmcli/latest --sort messages
 gmcli archive search '"flight details"' --dir ~/Backups/gmcli/latest
 gmcli archive messages <conv-id> --dir ~/Backups/gmcli/latest --limit 200
 gmcli archive context <conv-id> <message-id> --dir ~/Backups/gmcli/latest

@@ -30,13 +30,26 @@ type Source interface {
 
 type ConversationQuery struct {
 	Query         string
+	Sort          ConversationSort
 	Offset, Limit int
 }
+
+// ConversationSort controls conversation-list ordering.
+type ConversationSort string
+
+const (
+	// ConversationSortRecent orders by newest message activity first.
+	ConversationSortRecent ConversationSort = "recent"
+	// ConversationSortMessages orders by message count first, then recency.
+	ConversationSortMessages ConversationSort = "messages"
+)
+
 type ConversationPage struct {
-	Conversations []Conversation `json:"conversations"`
-	Total         int            `json:"total"`
-	Offset        int            `json:"offset"`
-	Limit         int            `json:"limit"`
+	Conversations []Conversation   `json:"conversations"`
+	Total         int              `json:"total"`
+	Offset        int              `json:"offset"`
+	Limit         int              `json:"limit"`
+	Sort          ConversationSort `json:"sort"`
 }
 type Cursor string
 type MessageQuery struct {
@@ -78,8 +91,8 @@ type MessageContext struct {
 const conversationColumns = `
 	c.conversation_id, c.source_platform, c.name, c.is_group, c.participants_json,
 	c.last_message_ts, c.unread, c.pinned, c.archived, c.updated_at,
-	(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.conversation_id),
-	COALESCE((SELECT COALESCE(m.body, '') FROM messages m WHERE m.conversation_id = c.conversation_id ORDER BY m.timestamp_ms DESC, m.message_id DESC LIMIT 1), '')`
+	(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.conversation_id) AS message_count,
+	COALESCE((SELECT COALESCE(m.body, '') FROM messages m WHERE m.conversation_id = c.conversation_id ORDER BY m.timestamp_ms DESC, m.message_id DESC LIMIT 1), '') AS preview`
 
 func (a *Archive) Metadata(ctx context.Context) (Meta, error) {
 	var conversations, messages int
@@ -94,6 +107,18 @@ func (a *Archive) Metadata(ctx context.Context) (Meta, error) {
 
 func (a *Archive) ListConversations(ctx context.Context, query ConversationQuery) (ConversationPage, error) {
 	limit, offset := bounded(query.Limit, 100, 1, 500), bounded(query.Offset, 0, 0, 1_000_000)
+	sortOrder := query.Sort
+	if sortOrder == "" {
+		sortOrder = ConversationSortRecent
+	}
+	orderBy := `c.last_message_ts DESC, c.conversation_id`
+	switch sortOrder {
+	case ConversationSortRecent:
+	case ConversationSortMessages:
+		orderBy = `message_count DESC, c.last_message_ts DESC, c.conversation_id`
+	default:
+		return ConversationPage{}, fmt.Errorf("unsupported conversation sort %q (want recent or messages)", sortOrder)
+	}
 	where := ""
 	var args []any
 	if needle := strings.TrimSpace(query.Query); needle != "" {
@@ -104,7 +129,7 @@ func (a *Archive) ListConversations(ctx context.Context, query ConversationQuery
 	if err := a.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM conversations c`+where, args...).Scan(&total); err != nil {
 		return ConversationPage{}, err
 	}
-	rows, err := a.store.DB().QueryContext(ctx, `SELECT `+conversationColumns+` FROM conversations c`+where+` ORDER BY c.last_message_ts DESC, c.conversation_id LIMIT ? OFFSET ?`, append(args, limit, offset)...)
+	rows, err := a.store.DB().QueryContext(ctx, `SELECT `+conversationColumns+` FROM conversations c`+where+` ORDER BY `+orderBy+` LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
 		return ConversationPage{}, err
 	}
@@ -117,7 +142,7 @@ func (a *Archive) ListConversations(ctx context.Context, query ConversationQuery
 		}
 		values = append(values, conversation)
 	}
-	return ConversationPage{Conversations: values, Total: total, Offset: offset, Limit: limit}, rows.Err()
+	return ConversationPage{Conversations: values, Total: total, Offset: offset, Limit: limit, Sort: sortOrder}, rows.Err()
 }
 
 func (a *Archive) GetConversation(ctx context.Context, id string) (Conversation, error) {

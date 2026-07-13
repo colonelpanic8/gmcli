@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,6 +69,50 @@ func TestJSONLSourceWithSQLiteCache(t *testing.T) {
 	}
 	if _, err := archive.GetConversation(ctx, "missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing conversation error = %v", err)
+	}
+}
+
+func TestConversationSorting(t *testing.T) {
+	dir, cachePath := writeFixture(t, fixtureMessages())
+	ctx := context.Background()
+	archive, err := Open(ctx, dir, OpenOptions{CachePath: cachePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+	if _, err := archive.store.DB().Exec(`
+		INSERT INTO conversations (
+			conversation_id, source_platform, name, participants_json,
+			last_message_ts, updated_at
+		) VALUES ('chat-2', 'gm', 'Large old chat', '[]', 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		if _, err := archive.store.DB().Exec(`
+			INSERT INTO messages (
+				message_id, conversation_id, source_platform, sender_id,
+				timestamp_ms, status, is_from_me, updated_at
+			) VALUES (?, 'chat-2', 'gm', '', ?, 0, 0, 1)`, fmt.Sprintf("large-%d", i), i+1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	recent, err := archive.ListConversations(ctx, ConversationQuery{Sort: ConversationSortRecent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recent.Sort != ConversationSortRecent || recent.Conversations[0].ID != "chat-1" {
+		t.Fatalf("recent order = %+v", recent)
+	}
+	mostMessages, err := archive.ListConversations(ctx, ConversationQuery{Sort: ConversationSortMessages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mostMessages.Sort != ConversationSortMessages || mostMessages.Conversations[0].ID != "chat-2" || mostMessages.Conversations[0].MessageCount != 6 {
+		t.Fatalf("message-count order = %+v", mostMessages)
+	}
+	if _, err := archive.ListConversations(ctx, ConversationQuery{Sort: "unknown"}); err == nil {
+		t.Fatal("invalid sort was accepted")
 	}
 }
 

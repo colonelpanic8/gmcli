@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/fdsouvenir/gmcli/internal/androidtelephony"
+	"github.com/fdsouvenir/gmcli/internal/hiddenfolders"
 	"github.com/fdsouvenir/gmcli/internal/output"
 )
 
@@ -15,7 +16,35 @@ func androidCmd() *cobra.Command {
 		Use:   "android",
 		Short: "Read data directly from a connected Android device",
 	}
-	c.AddCommand(androidExportTelephonyCmd(), androidVerifyTelephonyCmd())
+	c.AddCommand(androidExportTelephonyCmd(), androidVerifyTelephonyCmd(), androidVerifyHiddenFoldersCmd())
+	return c
+}
+
+func androidVerifyHiddenFoldersCmd() *cobra.Command {
+	var dir string
+	c := &cobra.Command{
+		Use:   "verify-hidden-folders",
+		Short: "Verify a supplemental Android Messages hidden-folder audit",
+		Long: "Rechecks the audit manifest, safe unique paths and conversation IDs, exact byte sizes, " +
+			"SHA-256 checksums, JSONL syntax and counts, record versions and types, and per-conversation ownership.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if dir == "" {
+				return fmt.Errorf("--dir is required")
+			}
+			result, err := hiddenfolders.Verify(dir)
+			if err != nil {
+				return err
+			}
+			if flags.jsonOut {
+				return output.JSON(os.Stdout, result)
+			}
+			fmt.Fprintf(os.Stderr, "Verified %d hidden-folder conversations and %d JSONL records in %s\n",
+				result.Conversations, result.Records, result.Path)
+			return nil
+		},
+	}
+	c.Flags().StringVar(&dir, "dir", "", "hidden-folder audit directory to verify (required)")
 	return c
 }
 

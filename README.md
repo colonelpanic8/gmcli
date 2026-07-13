@@ -204,6 +204,10 @@ optionally include content-addressed MMS attachments:
 gmcli android export-telephony --out ~/Backups/gmcli/telephony --force
 gmcli android verify-telephony --dir ~/Backups/gmcli/telephony
 
+# Verify an Android UI audit used to supplement relay-invisible folders:
+gmcli android verify-hidden-folders \
+  --dir ~/Backups/gmcli/supplemental/hidden-folders
+
 # Keep message/text metadata but omit binary MMS part bodies:
 gmcli android export-telephony --out ~/Backups/gmcli/telephony-jsonl \
   --force --include-part-data=false

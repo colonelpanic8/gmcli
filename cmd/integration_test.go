@@ -451,3 +451,43 @@ func TestExportJSONL(t *testing.T) {
 		t.Fatal("verification unexpectedly accepted a corrupt message file")
 	}
 }
+
+func TestAndroidVerifyHiddenFoldersCommand(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "conversations"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := []byte("{\"record_type\":\"conversation_observation\",\"format_version\":1,\"audit_conversation_id\":\"audit:one\",\"folder\":\"ARCHIVE\"}\n")
+	relativePath := "conversations/YXVkaXQ6b25l.jsonl"
+	if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(relativePath)), record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := map[string]any{
+		"format": "gmcli-hidden-folder-audit", "format_version": 1,
+		"generated_at": "2026-07-13T00:58:30Z", "source": "android_messages_ui",
+		"folder_snapshots": []any{}, "limitations": []any{},
+		"conversation_files": []any{map[string]any{
+			"audit_conversation_id": "audit:one", "folder": "ARCHIVE", "path": relativePath,
+			"records": 1, "bytes": len(record), "sha256": fmt.Sprintf("%x", sha256.Sum256(record)),
+		}},
+	}
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), manifestData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	output := runCmd(t, t.TempDir(), "--json", "android", "verify-hidden-folders", "--dir", dir)
+	var result struct {
+		Conversations int `json:"conversations"`
+		Records       int `json:"records"`
+	}
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("decode command result: %v\n%s", err, output)
+	}
+	if result.Conversations != 1 || result.Records != 1 {
+		t.Fatalf("unexpected command result: %+v", result)
+	}
+}

@@ -165,6 +165,15 @@ redundantly in every message. The directory and files use private permissions:
 ```sh
 gmcli export jsonl --out ~/Backups/gmcli/latest --force
 gmcli export verify --dir ~/Backups/gmcli/latest
+
+# Build a derived participant-set view across the relay and Android provider
+# archives. Raw source archives remain unchanged, and every unified message
+# retains source-record provenance:
+gmcli export unified-jsonl \
+  --relay-dir ~/Backups/gmcli/latest \
+  --telephony-dir ~/Backups/gmcli/telephony \
+  --out ~/Backups/gmcli/unified --force
+gmcli export verify-unified --dir ~/Backups/gmcli/unified
 gmcli coverage
 gmcli --json coverage --conversation <conv-id>
 gmcli coverage verify

@@ -166,14 +166,14 @@ redundantly in every message. The directory and files use private permissions:
 gmcli export jsonl --out ~/Backups/gmcli/latest --force
 gmcli export verify --dir ~/Backups/gmcli/latest
 
-# Build a derived participant-set view across the relay and Android provider
-# archives. Raw source archives remain unchanged, and every unified message
-# retains source-record provenance:
-gmcli export unified-jsonl \
-  --relay-dir ~/Backups/gmcli/latest \
-  --telephony-dir ~/Backups/gmcli/telephony \
-  --out ~/Backups/gmcli/unified --force
-gmcli export verify-unified --dir ~/Backups/gmcli/unified
+# Dynamically join fragmented relay and Android conversations. The two JSONL
+# archives remain the only sources of truth; no third archive is written:
+gmcli archive unified meta --dir ~/Backups/gmcli/latest \
+  --telephony-dir ~/Backups/gmcli/telephony
+gmcli archive unified conversations --dir ~/Backups/gmcli/latest \
+  --telephony-dir ~/Backups/gmcli/telephony --sort messages
+gmcli archive unified messages e164:+12025550123 \
+  --dir ~/Backups/gmcli/latest --telephony-dir ~/Backups/gmcli/telephony
 gmcli coverage
 gmcli --json coverage --conversation <conv-id>
 gmcli coverage verify

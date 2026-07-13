@@ -5,7 +5,6 @@ package unifiedarchive
 import (
 	"bufio"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,31 +16,21 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/fdsouvenir/gmcli/internal/androidtelephony"
 	"github.com/fdsouvenir/gmcli/internal/archive"
 )
 
 const (
-	Format        = "gmcli-unified-jsonl"
+	Format        = "gmcli-unified-view"
 	FormatVersion = 1
 	mergeWindowMS = int64(2000)
 )
 
 var e164Pattern = regexp.MustCompile(`^\+[1-9][0-9]{6,14}$`)
 
-// Options configures a unified archive export.
-type Options struct {
-	RelayDirectory     string
-	TelephonyDirectory string
-	OutputDirectory    string
-	Force              bool
-}
-
-// Result describes an installed unified archive.
+// Result summarizes a dynamic unified view.
 type Result struct {
-	Path                    string `json:"path"`
 	Format                  string `json:"format"`
 	FormatVersion           int    `json:"format_version"`
 	Conversations           int    `json:"conversations"`
@@ -51,31 +40,94 @@ type Result struct {
 	CrossSourceMatches      int    `json:"cross_source_matches"`
 }
 
-type manifest struct {
-	Format                  string                     `json:"format"`
-	FormatVersion           int                        `json:"format_version"`
-	GeneratedAt             time.Time                  `json:"generated_at"`
-	SelfE164                string                     `json:"self_e164"`
-	RelayManifestSHA256     string                     `json:"relay_manifest_sha256"`
-	TelephonyManifestSHA256 string                     `json:"telephony_manifest_sha256"`
-	ConversationsFile       manifestFile               `json:"conversations_file"`
-	ConversationMessages    []manifestConversationFile `json:"conversation_messages"`
+// Dataset is an in-memory canonical view over verified relay and Telephony
+// source archives. It owns no files and can be discarded after each query.
+type Dataset struct {
+	selfE164 string
+	builds   map[string]*conversationBuild
 }
 
-type manifestFile struct {
-	Path    string `json:"path"`
-	Records int    `json:"records"`
-	Bytes   int64  `json:"bytes"`
-	SHA256  string `json:"sha256"`
+// Open verifies and dynamically unifies the two source archives without
+// writing a derived archive.
+func Open(relayDirectory, telephonyDirectory string) (*Dataset, error) {
+	if relayDirectory == "" || telephonyDirectory == "" {
+		return nil, errors.New("relay and telephony directories are required")
+	}
+	if _, err := archive.VerifyJSONL(relayDirectory); err != nil {
+		return nil, fmt.Errorf("verify relay archive: %w", err)
+	}
+	if _, err := androidtelephony.Verify(telephonyDirectory); err != nil {
+		return nil, fmt.Errorf("verify telephony archive: %w", err)
+	}
+	relayDir, err := filepath.Abs(relayDirectory)
+	if err != nil {
+		return nil, err
+	}
+	telephonyDir, err := filepath.Abs(telephonyDirectory)
+	if err != nil {
+		return nil, err
+	}
+	relayManifestPath := filepath.Join(relayDir, "manifest.json")
+	telephonyManifestPath := filepath.Join(telephonyDir, "manifest.json")
+	var rm relayManifest
+	if err := readJSONFile(relayManifestPath, &rm); err != nil {
+		return nil, err
+	}
+	var tm telephonyManifest
+	if err := readJSONFile(telephonyManifestPath, &tm); err != nil {
+		return nil, err
+	}
+	conversationsPath := "conversations.jsonl"
+	if entry, ok := rm.Files["conversations"]; ok && entry.Path != "" {
+		conversationsPath = entry.Path
+	}
+	relayConversations, selfE164, err := loadRelayConversations(filepath.Join(relayDir, filepath.FromSlash(conversationsPath)))
+	if err != nil {
+		return nil, err
+	}
+	builds := make(map[string]*conversationBuild)
+	if err := loadRelayMessages(relayDir, rm, relayConversations, selfE164, builds); err != nil {
+		return nil, err
+	}
+	if err := loadTelephonyMessages(telephonyDir, tm, selfE164, relayNameLookup(relayConversations), builds); err != nil {
+		return nil, err
+	}
+	return &Dataset{selfE164: selfE164, builds: builds}, nil
 }
 
-type manifestConversationFile struct {
-	CanonicalConversationID string   `json:"canonical_conversation_id"`
-	Path                    string   `json:"path"`
-	Messages                int      `json:"messages"`
-	Bytes                   int64    `json:"bytes"`
-	SHA256                  string   `json:"sha256"`
-	Participants            []string `json:"participants"`
+// Result summarizes the dynamic view.
+func (d *Dataset) Result() Result {
+	result := Result{Format: Format, FormatVersion: FormatVersion, Conversations: len(d.builds)}
+	for _, build := range d.builds {
+		result.Messages += len(build.messages)
+		result.RelaySourceMessages += build.relaySourceMessages
+		result.TelephonySourceMessages += build.telephonyMessages
+		result.CrossSourceMatches += build.crossSourceMatches
+	}
+	return result
+}
+
+// Conversations returns canonical conversation metadata ordered by ID.
+func (d *Dataset) Conversations() []Conversation {
+	ids := make([]string, 0, len(d.builds))
+	for id := range d.builds {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	values := make([]Conversation, 0, len(ids))
+	for _, id := range ids {
+		values = append(values, conversationRecord(d.builds[id]))
+	}
+	return values
+}
+
+// Messages returns a copy of one canonical conversation's ordered messages.
+func (d *Dataset) Messages(canonicalID string) ([]Message, bool) {
+	build, ok := d.builds[canonicalID]
+	if !ok {
+		return nil, false
+	}
+	return append([]Message(nil), build.messages...), true
 }
 
 type relayManifest struct {
@@ -200,110 +252,6 @@ type conversationBuild struct {
 	relaySourceMessages int
 	telephonyMessages   int
 	crossSourceMatches  int
-}
-
-type sourceMessage struct {
-	canonicalID string
-	numbers     []string
-	names       map[string]string
-	message     Message
-}
-
-// Write verifies both source archives, builds a derived canonical view, and
-// atomically installs it. Source archives are never modified.
-func Write(options Options) (Result, error) {
-	if options.RelayDirectory == "" || options.TelephonyDirectory == "" || options.OutputDirectory == "" {
-		return Result{}, errors.New("relay, telephony, and output directories are required")
-	}
-	if _, err := archive.VerifyJSONL(options.RelayDirectory); err != nil {
-		return Result{}, fmt.Errorf("verify relay archive: %w", err)
-	}
-	if _, err := androidtelephony.Verify(options.TelephonyDirectory); err != nil {
-		return Result{}, fmt.Errorf("verify telephony archive: %w", err)
-	}
-	relayDir, err := filepath.Abs(options.RelayDirectory)
-	if err != nil {
-		return Result{}, err
-	}
-	telephonyDir, err := filepath.Abs(options.TelephonyDirectory)
-	if err != nil {
-		return Result{}, err
-	}
-	out, err := filepath.Abs(options.OutputDirectory)
-	if err != nil {
-		return Result{}, err
-	}
-	if !options.Force {
-		if _, err := os.Stat(out); err == nil {
-			return Result{}, fmt.Errorf("output already exists: %s (use --force to replace it)", out)
-		} else if !os.IsNotExist(err) {
-			return Result{}, err
-		}
-	}
-	if err := os.MkdirAll(filepath.Dir(out), 0o700); err != nil {
-		return Result{}, err
-	}
-	tmp, err := os.MkdirTemp(filepath.Dir(out), ".gmcli-unified-*")
-	if err != nil {
-		return Result{}, err
-	}
-	installed := false
-	defer func() {
-		if !installed {
-			_ = os.RemoveAll(tmp)
-		}
-	}()
-	if err := os.Chmod(tmp, 0o700); err != nil {
-		return Result{}, err
-	}
-
-	relayManifestPath := filepath.Join(relayDir, "manifest.json")
-	telephonyManifestPath := filepath.Join(telephonyDir, "manifest.json")
-	var rm relayManifest
-	if err := readJSONFile(relayManifestPath, &rm); err != nil {
-		return Result{}, err
-	}
-	var tm telephonyManifest
-	if err := readJSONFile(telephonyManifestPath, &tm); err != nil {
-		return Result{}, err
-	}
-	conversationsPath := "conversations.jsonl"
-	if entry, ok := rm.Files["conversations"]; ok && entry.Path != "" {
-		conversationsPath = entry.Path
-	}
-	relayConversations, selfE164, err := loadRelayConversations(filepath.Join(relayDir, filepath.FromSlash(conversationsPath)))
-	if err != nil {
-		return Result{}, err
-	}
-	builds := make(map[string]*conversationBuild)
-	if err := loadRelayMessages(relayDir, rm, relayConversations, selfE164, builds); err != nil {
-		return Result{}, err
-	}
-	if err := loadTelephonyMessages(telephonyDir, tm, selfE164, relayNameLookup(relayConversations), builds); err != nil {
-		return Result{}, err
-	}
-
-	result, outputManifest, err := writeOutput(tmp, builds, selfE164)
-	if err != nil {
-		return Result{}, err
-	}
-	outputManifest.RelayManifestSHA256, _, err = fileDigest(relayManifestPath)
-	if err != nil {
-		return Result{}, err
-	}
-	outputManifest.TelephonyManifestSHA256, _, err = fileDigest(telephonyManifestPath)
-	if err != nil {
-		return Result{}, err
-	}
-	if err := writeJSONFile(filepath.Join(tmp, "manifest.json"), outputManifest); err != nil {
-		return Result{}, err
-	}
-	if err := installDirectory(tmp, out, options.Force); err != nil {
-		return Result{}, err
-	}
-	installed = true
-	result.Path = out
-	return result, nil
 }
 
 func loadRelayConversations(path string) (map[string]relayConversation, string, error) {
@@ -714,61 +662,28 @@ func unifiedMessageID(canonicalID string, source SourceRef) string {
 	return hex.EncodeToString(sum[:16])
 }
 
-func writeOutput(dir string, builds map[string]*conversationBuild, self string) (Result, manifest, error) {
-	messagesDir := filepath.Join(dir, "messages")
-	if err := os.Mkdir(messagesDir, 0o700); err != nil {
-		return Result{}, manifest{}, err
+func conversationRecord(build *conversationBuild) Conversation {
+	participants := make([]Participant, 0, len(build.numbers))
+	for _, number := range build.numbers {
+		participants = append(participants, Participant{E164: number, Name: build.names[number]})
 	}
-	ids := make([]string, 0, len(builds))
-	for id := range builds {
-		ids = append(ids, id)
+	conversation := Conversation{
+		RecordType: "unified_conversation", FormatVersion: FormatVersion,
+		CanonicalConversationID: build.id, Name: conversationName(build), Participants: participants,
+		RelayConversationIDs: sortedKeys(build.relayIDs), TelephonyThreadIDs: sortedKeys(build.threadIDs),
+		Messages: len(build.messages), RelaySourceMessages: build.relaySourceMessages,
+		TelephonySourceMessages: build.telephonyMessages, CrossSourceMatches: build.crossSourceMatches,
 	}
-	sort.Strings(ids)
-	result := Result{Format: Format, FormatVersion: FormatVersion}
-	conversationRecords := make([]Conversation, 0, len(ids))
-	conversationFiles := make([]manifestConversationFile, 0, len(ids))
-	for _, id := range ids {
-		build := builds[id]
-		sortMessages(build.messages)
-		participants := make([]Participant, 0, len(build.numbers))
-		for _, number := range build.numbers {
-			participants = append(participants, Participant{E164: number, Name: build.names[number]})
-		}
-		conversation := Conversation{
-			RecordType: "unified_conversation", FormatVersion: FormatVersion,
-			CanonicalConversationID: id, Name: conversationName(build), Participants: participants,
-			RelayConversationIDs: sortedKeys(build.relayIDs), TelephonyThreadIDs: sortedKeys(build.threadIDs),
-			Messages: len(build.messages), RelaySourceMessages: build.relaySourceMessages,
-			TelephonySourceMessages: build.telephonyMessages, CrossSourceMatches: build.crossSourceMatches,
-		}
-		if len(build.messages) > 0 {
-			for _, message := range build.messages {
-				if message.TimestampMS > 0 {
-					conversation.FirstMessageMS = message.TimestampMS
-					break
-				}
+	if len(build.messages) > 0 {
+		for _, message := range build.messages {
+			if message.TimestampMS > 0 {
+				conversation.FirstMessageMS = message.TimestampMS
+				break
 			}
-			conversation.LastMessageMS = build.messages[len(build.messages)-1].TimestampMS
 		}
-		conversationRecords = append(conversationRecords, conversation)
-		name := base64.RawURLEncoding.EncodeToString([]byte(id)) + ".jsonl"
-		relativePath := filepath.ToSlash(filepath.Join("messages", name))
-		file, err := writeJSONL(filepath.Join(dir, filepath.FromSlash(relativePath)), build.messages)
-		if err != nil {
-			return Result{}, manifest{}, err
-		}
-		conversationFiles = append(conversationFiles, manifestConversationFile{CanonicalConversationID: id, Path: relativePath, Messages: len(build.messages), Bytes: file.Bytes, SHA256: file.SHA256, Participants: append([]string(nil), build.numbers...)})
-		result.Conversations++
-		result.Messages += len(build.messages)
-		result.RelaySourceMessages += build.relaySourceMessages
-		result.TelephonySourceMessages += build.telephonyMessages
-		result.CrossSourceMatches += build.crossSourceMatches
+		conversation.LastMessageMS = build.messages[len(build.messages)-1].TimestampMS
 	}
-	conversationsFile, err := writeJSONL(filepath.Join(dir, "conversations.jsonl"), conversationRecords)
-	if err != nil {
-		return Result{}, manifest{}, err
-	}
-	return result, manifest{Format: Format, FormatVersion: FormatVersion, GeneratedAt: time.Now().UTC(), SelfE164: self, ConversationsFile: manifestFile{Path: "conversations.jsonl", Records: len(conversationRecords), Bytes: conversationsFile.Bytes, SHA256: conversationsFile.SHA256}, ConversationMessages: conversationFiles}, nil
+	return conversation
 }
 
 func conversationName(build *conversationBuild) string {
@@ -875,59 +790,6 @@ func readJSONL(path string, visit func([]byte) error) error {
 	return nil
 }
 
-type writtenFile struct {
-	Bytes  int64
-	SHA256 string
-}
-
-func writeJSONL[T any](path string, values []T) (writtenFile, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return writtenFile{}, err
-	}
-	writer := bufio.NewWriterSize(file, 1<<20)
-	encoder := json.NewEncoder(writer)
-	encoder.SetEscapeHTML(false)
-	for _, value := range values {
-		if err := encoder.Encode(value); err != nil {
-			_ = file.Close()
-			return writtenFile{}, err
-		}
-	}
-	if err := writer.Flush(); err != nil {
-		_ = file.Close()
-		return writtenFile{}, err
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return writtenFile{}, err
-	}
-	if err := file.Close(); err != nil {
-		return writtenFile{}, err
-	}
-	digest, bytes, err := fileDigest(path)
-	return writtenFile{Bytes: bytes, SHA256: digest}, err
-}
-
-func writeJSONFile(path string, value any) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(value); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return err
-	}
-	return file.Close()
-}
-
 func readJSONFile(path string, value any) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -937,34 +799,4 @@ func readJSONFile(path string, value any) error {
 		return fmt.Errorf("decode %s: %w", path, err)
 	}
 	return nil
-}
-
-func fileDigest(path string) (string, int64, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", 0, err
-	}
-	defer file.Close()
-	hash := sha256.New()
-	bytes, err := io.Copy(hash, file)
-	if err != nil {
-		return "", 0, err
-	}
-	return hex.EncodeToString(hash.Sum(nil)), bytes, nil
-}
-
-func installDirectory(tmp, destination string, force bool) error {
-	if !force {
-		return os.Rename(tmp, destination)
-	}
-	backup := destination + ".old"
-	_ = os.RemoveAll(backup)
-	if err := os.Rename(destination, backup); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if err := os.Rename(tmp, destination); err != nil {
-		_ = os.Rename(backup, destination)
-		return err
-	}
-	return os.RemoveAll(backup)
 }

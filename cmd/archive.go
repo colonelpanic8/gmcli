@@ -4,11 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/fdsouvenir/gmcli/internal/output"
+	"github.com/fdsouvenir/gmcli/internal/unifiedarchive"
 	archiveview "github.com/fdsouvenir/gmcli/internal/viewer"
 )
 
@@ -24,7 +27,213 @@ func archiveCmd() *cobra.Command {
 	c.PersistentFlags().StringVar(&options.dir, "dir", "", "authoritative JSONL archive directory (required)")
 	c.PersistentFlags().StringVar(&options.cachePath, "cache", "", "SQLite cache path (default: $XDG_CACHE_HOME/gmcli/archives/<fingerprint>.sqlite)")
 	c.PersistentFlags().BoolVar(&options.rebuild, "rebuild-cache", false, "discard and rebuild the disposable SQLite cache")
-	c.AddCommand(archiveMetaCmd(&options), archiveConversationsCmd(&options), archiveMessagesCmd(&options), archiveSearchCmd(&options), archiveContextCmd(&options))
+	c.AddCommand(archiveMetaCmd(&options), archiveConversationsCmd(&options), archiveMessagesCmd(&options), archiveSearchCmd(&options), archiveContextCmd(&options), archiveUnifiedCmd(&options))
+	return c
+}
+
+type unifiedArchiveFlags struct {
+	telephonyDir string
+}
+
+func archiveUnifiedCmd(options *archiveFlags) *cobra.Command {
+	var unified unifiedArchiveFlags
+	c := &cobra.Command{
+		Use:   "unified",
+		Short: "Dynamically unify relay and Android conversation fragments",
+		Long: "Verifies both source archives and computes a canonical participant-set view in memory. " +
+			"It does not write or cache a third archive.",
+	}
+	c.PersistentFlags().StringVar(&unified.telephonyDir, "telephony-dir", "", "authoritative Android Telephony archive directory (required)")
+	c.AddCommand(archiveUnifiedMetaCmd(options, &unified), archiveUnifiedConversationsCmd(options, &unified), archiveUnifiedMessagesCmd(options, &unified))
+	return c
+}
+
+func openUnifiedArchive(options *archiveFlags, unified *unifiedArchiveFlags) (*unifiedarchive.Dataset, error) {
+	if options.dir == "" {
+		return nil, errors.New("--dir is required for the relay archive")
+	}
+	if unified.telephonyDir == "" {
+		return nil, errors.New("--telephony-dir is required")
+	}
+	return unifiedarchive.Open(options.dir, unified.telephonyDir)
+}
+
+func archiveUnifiedMetaCmd(options *archiveFlags, unified *unifiedArchiveFlags) *cobra.Command {
+	return &cobra.Command{Use: "meta", Short: "Summarize the dynamic canonical view", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
+		dataset, err := openUnifiedArchive(options, unified)
+		if err != nil {
+			return err
+		}
+		result := dataset.Result()
+		if flags.jsonOut {
+			return output.JSON(os.Stdout, result)
+		}
+		fmt.Printf("conversations:             %d\nmessages:                  %d\nrelay source messages:     %d\nTelephony source messages: %d\ncross-source matches:      %d\n", result.Conversations, result.Messages, result.RelaySourceMessages, result.TelephonySourceMessages, result.CrossSourceMatches)
+		return nil
+	}}
+}
+
+type unifiedConversationPage struct {
+	Conversations []unifiedarchive.Conversation `json:"conversations"`
+	Total         int                           `json:"total"`
+	Limit         int                           `json:"limit"`
+	Offset        int                           `json:"offset"`
+}
+
+func archiveUnifiedConversationsCmd(options *archiveFlags, unified *unifiedArchiveFlags) *cobra.Command {
+	var limit, offset int
+	var sortOrder string
+	c := &cobra.Command{Use: "conversations [query]", Short: "List canonical conversations computed from both sources", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if limit <= 0 || offset < 0 {
+			return errors.New("--limit must be positive and --offset must be non-negative")
+		}
+		if sortOrder != "recent" && sortOrder != "messages" {
+			return fmt.Errorf("unsupported --sort %q (want recent or messages)", sortOrder)
+		}
+		dataset, err := openUnifiedArchive(options, unified)
+		if err != nil {
+			return err
+		}
+		values := dataset.Conversations()
+		query := ""
+		if len(args) == 1 {
+			query = strings.ToLower(args[0])
+		}
+		if query != "" {
+			filtered := values[:0]
+			for _, conversation := range values {
+				haystack := strings.ToLower(conversation.CanonicalConversationID + " " + conversation.Name)
+				for _, participant := range conversation.Participants {
+					haystack += " " + strings.ToLower(participant.Name+" "+participant.E164)
+				}
+				if strings.Contains(haystack, query) {
+					filtered = append(filtered, conversation)
+				}
+			}
+			values = filtered
+		}
+		sort.SliceStable(values, func(i, j int) bool {
+			if sortOrder == "messages" {
+				if values[i].Messages != values[j].Messages {
+					return values[i].Messages > values[j].Messages
+				}
+			} else if values[i].LastMessageMS != values[j].LastMessageMS {
+				return values[i].LastMessageMS > values[j].LastMessageMS
+			}
+			return values[i].CanonicalConversationID < values[j].CanonicalConversationID
+		})
+		total := len(values)
+		if offset > total {
+			offset = total
+		}
+		end := offset + limit
+		if end > total {
+			end = total
+		}
+		page := unifiedConversationPage{Conversations: values[offset:end], Total: total, Limit: limit, Offset: offset}
+		if flags.jsonOut {
+			return output.JSON(os.Stdout, page)
+		}
+		rows := make([][]string, 0, len(page.Conversations))
+		for _, conversation := range page.Conversations {
+			participants := make([]string, 0, len(conversation.Participants))
+			for _, participant := range conversation.Participants {
+				label := participant.Name
+				if label == "" {
+					label = participant.E164
+				}
+				participants = append(participants, label)
+			}
+			rows = append(rows, []string{output.FormatTime(conversation.LastMessageMS), fmt.Sprint(conversation.Messages), fmt.Sprint(conversation.RelaySourceMessages), fmt.Sprint(conversation.TelephonySourceMessages), truncate(strings.Join(participants, ", "), 38), truncate(conversation.Name, 36), conversation.CanonicalConversationID})
+		}
+		if len(rows) == 0 {
+			fmt.Fprintln(os.Stderr, "(no conversations)")
+			return nil
+		}
+		return output.Table(os.Stdout, []string{"last_msg", "messages", "relay", "android", "participants", "name", "canonical_id"}, rows)
+	}}
+	c.Flags().IntVar(&limit, "limit", 100, "max rows")
+	c.Flags().IntVar(&offset, "offset", 0, "rows to skip")
+	c.Flags().StringVar(&sortOrder, "sort", "recent", "sort order: recent or messages")
+	return c
+}
+
+type unifiedMessagePage struct {
+	CanonicalConversationID string                   `json:"canonical_conversation_id"`
+	Messages                []unifiedarchive.Message `json:"messages"`
+	Total                   int                      `json:"total"`
+	Limit                   int                      `json:"limit"`
+	Offset                  int                      `json:"offset"`
+}
+
+func archiveUnifiedMessagesCmd(options *archiveFlags, unified *unifiedArchiveFlags) *cobra.Command {
+	var limit, offset int
+	var sinceText, untilText string
+	c := &cobra.Command{Use: "messages <canonical-conversation-id>", Short: "List dynamically unified messages with source provenance", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if limit <= 0 || offset < 0 {
+			return errors.New("--limit must be positive and --offset must be non-negative")
+		}
+		since, err := parseFlagTime(sinceText)
+		if err != nil {
+			return err
+		}
+		until, err := parseFlagTime(untilText)
+		if err != nil {
+			return err
+		}
+		dataset, err := openUnifiedArchive(options, unified)
+		if err != nil {
+			return err
+		}
+		messages, ok := dataset.Messages(args[0])
+		if !ok {
+			return fmt.Errorf("canonical conversation %q not found", args[0])
+		}
+		filtered := messages[:0]
+		for _, message := range messages {
+			when := time.UnixMilli(message.TimestampMS)
+			if !since.IsZero() && when.Before(since) {
+				continue
+			}
+			if !until.IsZero() && !when.Before(until) {
+				continue
+			}
+			filtered = append(filtered, message)
+		}
+		total := len(filtered)
+		if offset > total {
+			offset = total
+		}
+		end := offset + limit
+		if end > total {
+			end = total
+		}
+		page := unifiedMessagePage{CanonicalConversationID: args[0], Messages: filtered[offset:end], Total: total, Limit: limit, Offset: offset}
+		if flags.jsonOut {
+			return output.JSON(os.Stdout, page)
+		}
+		rows := make([][]string, 0, len(page.Messages))
+		for _, message := range page.Messages {
+			direction := "<-"
+			if message.IsFromMe {
+				direction = "->"
+			}
+			body := ""
+			if message.Body != nil {
+				body = *message.Body
+			}
+			platforms := make([]string, 0, len(message.Sources))
+			for _, source := range message.Sources {
+				platforms = append(platforms, source.Platform)
+			}
+			rows = append(rows, []string{output.FormatTime(message.TimestampMS), direction, strings.Join(platforms, "+"), message.UnifiedMessageID, truncate(body, 96)})
+		}
+		return output.Table(os.Stdout, []string{"time", "dir", "sources", "message_id", "body"}, rows)
+	}}
+	c.Flags().IntVar(&limit, "limit", 200, "max messages")
+	c.Flags().IntVar(&offset, "offset", 0, "messages to skip")
+	c.Flags().StringVar(&sinceText, "since", "", "lower time bound (YYYY-MM-DD or RFC3339)")
+	c.Flags().StringVar(&untilText, "until", "", "exclusive upper time bound (YYYY-MM-DD or RFC3339)")
 	return c
 }
 

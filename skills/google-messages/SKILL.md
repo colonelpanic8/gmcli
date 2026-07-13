@@ -167,20 +167,21 @@ archive when a focused query will do.
    buffers, and downloaded media bytes. The command refuses to overwrite an
    existing file unless the user explicitly authorizes `--force`.
 
-9. **Build a unified relay/provider view.** When both a verified segmented
+9. **Query a unified relay/provider view.** When both a verified segmented
    relay archive and a verified Android Telephony archive are available, use
-   the derived unified export to join fragmented threads by exact non-self
-   E.164 participant sets while retaining source provenance:
+   the dynamic unified view to join fragmented threads by exact non-self E.164
+   participant sets while retaining source provenance:
 
    ```
-   gmcli --json --read-only export unified-jsonl \
-     --relay-dir '{relay_dir}' --telephony-dir '{telephony_dir}' \
-     --out '{unified_dir}'
-   gmcli --json --read-only export verify-unified --dir '{unified_dir}'
+   gmcli --json --read-only archive unified conversations \
+     --dir '{relay_dir}' --telephony-dir '{telephony_dir}' --sort messages
+   gmcli --json --read-only archive unified messages '{canonical_id}' \
+     --dir '{relay_dir}' --telephony-dir '{telephony_dir}'
    ```
 
-   This never modifies either source archive. It conservatively merges only
-   uniquely matching cross-source records; unmatched records remain separate.
+   This verifies and reads both source archives in memory and never writes a
+   third archive. It conservatively merges only uniquely matching cross-source
+   records; unmatched records remain separate.
 
 10. **Query a portable segmented JSONL archive.** When the user supplies or
    approves an archive directory, use the `archive` commands instead of the

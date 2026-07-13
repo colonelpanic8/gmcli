@@ -2,8 +2,6 @@ package unifiedarchive
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -76,53 +74,6 @@ func TestMMSContentSeparatesTextAndMedia(t *testing.T) {
 	body, attachments := mmsContent(parts, data)
 	if body == nil || *body != "caption" || len(attachments) != 1 || attachments[0].MediaPath != "media/hash" {
 		t.Fatalf("unexpected MMS content: body=%v attachments=%#v", body, attachments)
-	}
-}
-
-func TestWriteOutputAndVerify(t *testing.T) {
-	dir := t.TempDir()
-	build := testBuild("e164:+12025550101")
-	build.numbers = []string{"+12025550101"}
-	build.names["+12025550101"] = "Friend"
-	build.relayIDs["relay-1"] = struct{}{}
-	build.threadIDs["42"] = struct{}{}
-	build.relaySourceMessages = 1
-	build.telephonyMessages = 1
-	body := "hello"
-	message := testMessage(build.id, 1000, false, &body, SourceRef{Platform: "gm", RecordType: "message", ConversationID: "relay-1", RecordID: "gm-1", Path: "messages/one.jsonl"})
-	message.Sources = append(message.Sources, SourceRef{Platform: "android_telephony", RecordType: "sms", ThreadID: "42", RecordID: "7", Path: "threads/NDI.jsonl"})
-	build.messages = []Message{message}
-	build.crossSourceMatches = 1
-
-	_, manifestValue, err := writeOutput(dir, map[string]*conversationBuild{build.id: build}, "+12025550000")
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifestValue.RelayManifestSHA256 = strings.Repeat("a", 64)
-	manifestValue.TelephonyManifestSHA256 = strings.Repeat("b", 64)
-	if err := writeJSONFile(filepath.Join(dir, "manifest.json"), manifestValue); err != nil {
-		t.Fatal(err)
-	}
-	verified, err := Verify(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if verified.Conversations != 1 || verified.Messages != 1 || verified.CrossSourceMatches != 1 {
-		t.Fatalf("unexpected verification result: %+v", verified)
-	}
-
-	messagePath := filepath.Join(dir, filepath.FromSlash(manifestValue.ConversationMessages[0].Path))
-	file, err := os.OpenFile(messagePath, os.O_APPEND|os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.WriteString("{}\n"); err != nil {
-		_ = file.Close()
-		t.Fatal(err)
-	}
-	_ = file.Close()
-	if _, err := Verify(dir); err == nil || !strings.Contains(err.Error(), "integrity mismatch") {
-		t.Fatalf("corrupt archive verification error = %v", err)
 	}
 }
 

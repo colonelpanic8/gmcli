@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -13,6 +16,7 @@ import (
 	"github.com/fdsouvenir/gmcli/internal/output"
 	"github.com/fdsouvenir/gmcli/internal/unifiedarchive"
 	archiveview "github.com/fdsouvenir/gmcli/internal/viewer"
+	"github.com/fdsouvenir/gmcli/internal/viewerapi"
 )
 
 type archiveFlags struct {
@@ -27,7 +31,57 @@ func archiveCmd() *cobra.Command {
 	c.PersistentFlags().StringVar(&options.dir, "dir", "", "authoritative JSONL archive directory (required)")
 	c.PersistentFlags().StringVar(&options.cachePath, "cache", "", "SQLite cache path (default: $XDG_CACHE_HOME/gmcli/archives/<fingerprint>.sqlite)")
 	c.PersistentFlags().BoolVar(&options.rebuild, "rebuild-cache", false, "discard and rebuild the disposable SQLite cache")
-	c.AddCommand(archiveMetaCmd(&options), archiveConversationsCmd(&options), archiveMessagesCmd(&options), archiveSearchCmd(&options), archiveContextCmd(&options), archiveUnifiedCmd(&options))
+	c.AddCommand(archiveMetaCmd(&options), archiveConversationsCmd(&options), archiveMessagesCmd(&options), archiveSearchCmd(&options), archiveContextCmd(&options), archiveServeCmd(&options), archiveUnifiedCmd(&options))
+	return c
+}
+
+func archiveServeCmd(options *archiveFlags) *cobra.Command {
+	var listenAddress string
+	c := &cobra.Command{
+		Use:   "serve",
+		Short: "Serve the read-only archive HTTP API",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			archive, err := openArchive(cmd, options)
+			if err != nil {
+				return err
+			}
+			defer archive.Close()
+			listener, err := net.Listen("tcp", listenAddress)
+			if err != nil {
+				return fmt.Errorf("listen for archive API: %w", err)
+			}
+			defer listener.Close()
+			if tcp, ok := listener.Addr().(*net.TCPAddr); !ok || !tcp.IP.IsLoopback() {
+				return fmt.Errorf("archive API must listen on a loopback address, got %s", listener.Addr())
+			}
+			token := os.Getenv("GMCLI_ARCHIVE_API_TOKEN")
+			server := &http.Server{
+				Handler:           viewerapi.New(archive, viewerapi.Options{BearerToken: token}),
+				ReadHeaderTimeout: 5 * time.Second,
+				IdleTimeout:       60 * time.Second,
+			}
+			ctx, cancel := signalContext(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				select {
+				case <-ctx.Done():
+					shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer shutdownCancel()
+					_ = server.Shutdown(shutdownCtx)
+				case <-done:
+				}
+			}()
+			defer close(done)
+			fmt.Fprintf(os.Stderr, "archive API listening at http://%s\n", listener.Addr())
+			if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return fmt.Errorf("serve archive API: %w", err)
+			}
+			return nil
+		},
+	}
+	c.Flags().StringVar(&listenAddress, "listen", "127.0.0.1:7878", "loopback address for the HTTP API")
 	return c
 }
 

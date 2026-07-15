@@ -1,0 +1,7 @@
+[application]
+name = "gmcli-viewer"
+default_platform = "desktop"
+asset_dir = "assets"
+
+[desktop]
+title = "gmcli archive"

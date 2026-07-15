@@ -444,29 +444,72 @@ func (a *Archive) indexMessages(ctx context.Context, tx *sql.Tx, file desiredFil
 	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE conversation_id = ?`, file.ConversationID); err != nil {
-		return fmt.Errorf("clear cached messages for %q: %w", file.ConversationID, err)
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS archive_desired_message_ids (message_id TEXT PRIMARY KEY) WITHOUT ROWID`); err != nil {
+		return fmt.Errorf("initialize desired message IDs: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM archive_desired_message_ids`); err != nil {
+		return fmt.Errorf("clear desired message IDs: %w", err)
+	}
+	rememberID, err := tx.PrepareContext(ctx, `INSERT INTO archive_desired_message_ids (message_id) VALUES (?)`)
+	if err != nil {
+		return fmt.Errorf("prepare desired message ID insert: %w", err)
+	}
+	defer rememberID.Close()
+	insert, err := tx.PrepareContext(ctx, `
+		INSERT INTO messages (
+			message_id, conversation_id, source_platform, sender_id, body,
+			timestamp_ms, status, is_from_me, media_id, mime_type,
+			decryption_key, reactions_json, reply_to_id, raw_proto, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?)
+		ON CONFLICT(message_id) DO UPDATE SET
+			conversation_id = excluded.conversation_id,
+			source_platform = excluded.source_platform,
+			sender_id = excluded.sender_id,
+			body = excluded.body,
+			timestamp_ms = excluded.timestamp_ms,
+			status = excluded.status,
+			is_from_me = excluded.is_from_me,
+			media_id = excluded.media_id,
+			mime_type = excluded.mime_type,
+			reactions_json = excluded.reactions_json,
+			reply_to_id = excluded.reply_to_id,
+			updated_at = excluded.updated_at
+		WHERE messages.conversation_id IS NOT excluded.conversation_id
+			OR messages.source_platform IS NOT excluded.source_platform
+			OR messages.sender_id IS NOT excluded.sender_id
+			OR messages.body IS NOT excluded.body
+			OR messages.timestamp_ms IS NOT excluded.timestamp_ms
+			OR messages.status IS NOT excluded.status
+			OR messages.is_from_me IS NOT excluded.is_from_me
+			OR messages.media_id IS NOT excluded.media_id
+			OR messages.mime_type IS NOT excluded.mime_type
+			OR messages.reactions_json IS NOT excluded.reactions_json
+			OR messages.reply_to_id IS NOT excluded.reply_to_id`)
+	if err != nil {
+		return fmt.Errorf("prepare cached message insert: %w", err)
+	}
+	defer insert.Close()
 	now := time.Now().UnixMilli()
 	for _, message := range messages {
 		if message.ID == "" || message.ConversationID != file.ConversationID {
 			return fmt.Errorf("message %q belongs to conversation %q, expected %q", message.ID, message.ConversationID, file.ConversationID)
 		}
+		if _, err := rememberID.ExecContext(ctx, message.ID); err != nil {
+			return fmt.Errorf("remember message %q for conversation %q: %w", message.ID, file.ConversationID, err)
+		}
 		var reactions any
 		if len(message.Reactions) > 0 && string(message.Reactions) != "null" {
 			reactions = string(message.Reactions)
 		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO messages (
-				message_id, conversation_id, source_platform, sender_id, body,
-				timestamp_ms, status, is_from_me, media_id, mime_type,
-				decryption_key, reactions_json, reply_to_id, raw_proto, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?)`,
+		if _, err := insert.ExecContext(ctx,
 			message.ID, message.ConversationID, message.SourcePlatform, message.SenderID, message.Body,
 			message.TimestampMS, message.Status, boolInt(message.IsFromMe), message.MediaID, message.MimeType,
 			reactions, message.ReplyToID, now); err != nil {
 			return fmt.Errorf("index message %q: %w", message.ID, err)
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE conversation_id = ? AND message_id NOT IN (SELECT message_id FROM archive_desired_message_ids)`, file.ConversationID); err != nil {
+		return fmt.Errorf("remove stale cached messages for %q: %w", file.ConversationID, err)
 	}
 	return recordIndexedFile(ctx, tx, file)
 }

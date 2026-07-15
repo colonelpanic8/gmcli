@@ -3,6 +3,7 @@ package viewer
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -124,6 +125,8 @@ func TestCacheRefreshesOnlyChangedManifestFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	indexedAt := indexedFileTime(t, archive, "messages/Y2hhdC0x.jsonl")
+	unchangedUpdatedAt := cachedMessageTime(t, archive, "m0")
+	changedUpdatedAt := cachedMessageTime(t, archive, "m1")
 	if err := archive.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +143,10 @@ func TestCacheRefreshesOnlyChangedManifestFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	messages := append(fixtureMessages(), Message{ID: "m4", ConversationID: "chat-1", SourcePlatform: "gm", SenderID: "friend", Body: stringPtr("new"), TimestampMS: 4})
+	messages := fixtureMessages()
+	messages[1].Body = stringPtr("second changed")
+	messages = append(messages[:2], messages[3:]...)
+	messages = append(messages, Message{ID: "m4", ConversationID: "chat-1", SourcePlatform: "gm", SenderID: "friend", Body: stringPtr("new"), TimestampMS: 4})
 	writeMessagesAndManifest(t, dir, messages)
 	time.Sleep(2 * time.Millisecond)
 	archive, err = Open(ctx, dir, OpenOptions{CachePath: cachePath})
@@ -149,11 +155,24 @@ func TestCacheRefreshesOnlyChangedManifestFiles(t *testing.T) {
 	}
 	defer archive.Close()
 	meta, err := archive.Metadata(ctx)
-	if err != nil || meta.Messages != 5 {
+	if err != nil || meta.Messages != 4 {
 		t.Fatalf("metadata after refresh = %+v, err = %v", meta, err)
 	}
 	if got := indexedFileTime(t, archive, "messages/Y2hhdC0x.jsonl"); got <= indexedAt {
 		t.Fatalf("changed file indexed_at = %d, want > %d", got, indexedAt)
+	}
+	if got := cachedMessageTime(t, archive, "m0"); got != unchangedUpdatedAt {
+		t.Fatalf("unchanged message was rewritten: %d != %d", got, unchangedUpdatedAt)
+	}
+	if got := cachedMessageTime(t, archive, "m1"); got <= changedUpdatedAt {
+		t.Fatalf("changed message updated_at = %d, want > %d", got, changedUpdatedAt)
+	}
+	if _, err := archive.getMessage(ctx, "chat-1", "m2"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("removed source message remains cached: %v", err)
+	}
+	search, err := archive.SearchMessages(ctx, SearchQuery{Query: "changed"})
+	if err != nil || search.Total != 1 || search.Hits[0].Message.ID != "m1" {
+		t.Fatalf("updated search = %+v, err = %v", search, err)
 	}
 }
 
@@ -208,6 +227,15 @@ func indexedFileTime(t *testing.T, archive *Archive, path string) int64 {
 	t.Helper()
 	var value int64
 	if err := archive.store.DB().QueryRow(`SELECT indexed_at FROM archive_cache_files WHERE path = ?`, path).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func cachedMessageTime(t *testing.T, archive *Archive, id string) int64 {
+	t.Helper()
+	var value int64
+	if err := archive.store.DB().QueryRow(`SELECT updated_at FROM messages WHERE message_id = ?`, id).Scan(&value); err != nil {
 		t.Fatal(err)
 	}
 	return value

@@ -53,7 +53,12 @@ nix profile install github:fdsouvenir/gmcli
 ```
 
 The flake publishes `packages.<system>.gmcli`, a default package and app, and
-`overlays.default` for NixOS or nix-darwin configurations.
+`overlays.default` for NixOS or nix-darwin configurations. On Linux it also
+publishes the Dioxus desktop archive viewer:
+
+```sh
+nix run github:fdsouvenir/gmcli#viewer -- --archive-dir ~/Backups/gmcli/latest
+```
 
 To build from source without Nix:
 
@@ -187,14 +192,24 @@ gmcli archive conversations --dir ~/Backups/gmcli/latest --sort messages
 gmcli archive search '"flight details"' --dir ~/Backups/gmcli/latest
 gmcli archive messages <conv-id> --dir ~/Backups/gmcli/latest --limit 200
 gmcli archive context <conv-id> <message-id> --dir ~/Backups/gmcli/latest
+
+# Serve the same query surface over a read-only, loopback-only HTTP API.
+gmcli archive serve --dir ~/Backups/gmcli/latest --listen 127.0.0.1:7878
+
+# Or launch the desktop viewer, which starts a private authenticated API child
+# process automatically. GMCLI_ARCHIVE_DIR can supply the default archive.
+gmcli-viewer --archive-dir ~/Backups/gmcli/latest
 ```
 
 `gmcli archive` is the renderer-independent query boundary for portable
 backups. Its typed query layer is shared by the table and `--json` CLI output
-and is intended to support a future TUI or viewer without making SQLite the
-source of truth. The default cache path is derived from the archive's absolute
+and the versioned `/api/v1` HTTP surface consumed by `gmcli-viewer`. The viewer
+never reads SQLite or shells out for individual queries. JSONL remains the
+source of truth, while the derived cache is incrementally refreshed from
+manifest hashes. The default cache path is derived from the archive's absolute
 path; a cache is pinned to one archive and gmcli refuses to repurpose an
-unrelated SQLite database supplied through `--cache`.
+unrelated SQLite database supplied through `--cache`. See
+[`docs/archive-api.md`](docs/archive-api.md) for the endpoint contract.
 
 Coverage is evidence-based and is never inferred from message counts. Each
 successful history page immediately records a per-conversation half-open time
@@ -253,10 +268,12 @@ internal/
                       WaitForReady, DownloadMedia
   store/              SQLite + FTS5 store (schema v4: aliases, send cache, coverage)
   viewer/             JSONL-authoritative queries + disposable SQLite/FTS cache
+  viewerapi/          Read-only versioned HTTP adapter for viewer clients
   sync/               Event-to-store pump
   output/             Shared JSON / tab-aligned table renderers
   paths/              XDG path resolution (XDG_STATE_HOME)
   logging/            zerolog setup
+desktop/              Dioxus desktop archive viewer (Rust + HTML/CSS)
 skills/
   google-messages/    LLM skill bundle - archive playbook for assistants
 docs/research/        Phase 1 research notes

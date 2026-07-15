@@ -36,6 +36,11 @@ another page exists. `before` and `after` are mutually exclusive.
 
 Only one sync may run at a time. A concurrent request receives `409 Conflict`.
 Sync never sends a message, but it does require the paired phone to be online.
+By default it runs `gmcli sync` followed by `gmcli export jsonl`. Managed
+installations can pass `archive serve --sync-command /path/to/job` or set
+`GMCLI_ARCHIVE_SYNC_COMMAND`; the trusted executable must refresh the archive
+directory, after which the server verifies and incrementally refreshes its
+open cache.
 
 `gmcli-viewer` starts this server as a private child process on a random
 loopback port with a fresh bearer token. It can instead connect to an existing

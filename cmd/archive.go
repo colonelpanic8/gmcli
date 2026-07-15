@@ -30,9 +30,10 @@ type archiveFlags struct {
 }
 
 type archiveSyncer struct {
-	archive    *archiveview.Archive
-	archiveDir string
-	mu         sync.Mutex
+	archive     *archiveview.Archive
+	archiveDir  string
+	syncCommand string
+	mu          sync.Mutex
 }
 
 func (s *archiveSyncer) Sync(ctx context.Context) (viewerapi.SyncResult, error) {
@@ -40,27 +41,36 @@ func (s *archiveSyncer) Sync(ctx context.Context) (viewerapi.SyncResult, error) 
 		return viewerapi.SyncResult{}, viewerapi.ErrSyncInProgress
 	}
 	defer s.mu.Unlock()
-	executable, err := os.Executable()
-	if err != nil {
-		return viewerapi.SyncResult{}, fmt.Errorf("locate gmcli executable: %w", err)
+	type commandSpec struct {
+		executable string
+		arguments  []string
 	}
-	for _, arguments := range [][]string{
-		{"sync"},
-		{"export", "jsonl", "--out", s.archiveDir, "--force"},
-	} {
+	commands := []commandSpec{{executable: s.syncCommand}}
+	if s.syncCommand == "" {
+		executable, err := os.Executable()
+		if err != nil {
+			return viewerapi.SyncResult{}, fmt.Errorf("locate gmcli executable: %w", err)
+		}
+		commands = []commandSpec{
+			{executable: executable, arguments: []string{"sync"}},
+			{executable: executable, arguments: []string{"export", "jsonl", "--out", s.archiveDir, "--force"}},
+		}
+	}
+	for _, spec := range commands {
 		var commandErrors bytes.Buffer
-		command := exec.CommandContext(ctx, executable, arguments...)
+		command := exec.CommandContext(ctx, spec.executable, spec.arguments...)
 		command.Stdout = os.Stderr
 		command.Stderr = io.MultiWriter(os.Stderr, &commandErrors)
+		label := strings.TrimSpace(strings.Join(append([]string{spec.executable}, spec.arguments...), " "))
 		if err := command.Run(); err != nil {
 			detail := strings.TrimSpace(commandErrors.String())
 			if len(detail) > 2_000 {
 				detail = detail[len(detail)-2_000:]
 			}
 			if detail != "" {
-				return viewerapi.SyncResult{}, fmt.Errorf("gmcli %s failed: %s", strings.Join(arguments, " "), detail)
+				return viewerapi.SyncResult{}, fmt.Errorf("%s failed: %s", label, detail)
 			}
-			return viewerapi.SyncResult{}, fmt.Errorf("gmcli %s: %w", strings.Join(arguments, " "), err)
+			return viewerapi.SyncResult{}, fmt.Errorf("%s: %w", label, err)
 		}
 	}
 	if err := s.archive.Refresh(ctx); err != nil {
@@ -89,6 +99,7 @@ func archiveCmd() *cobra.Command {
 
 func archiveServeCmd(options *archiveFlags) *cobra.Command {
 	var listenAddress string
+	var syncCommand string
 	c := &cobra.Command{
 		Use:   "serve",
 		Short: "Serve the local archive query and sync HTTP API",
@@ -108,7 +119,7 @@ func archiveServeCmd(options *archiveFlags) *cobra.Command {
 				return fmt.Errorf("archive API must listen on a loopback address, got %s", listener.Addr())
 			}
 			token := os.Getenv("GMCLI_ARCHIVE_API_TOKEN")
-			syncer := &archiveSyncer{archive: archive, archiveDir: options.dir}
+			syncer := &archiveSyncer{archive: archive, archiveDir: options.dir, syncCommand: syncCommand}
 			server := &http.Server{
 				Handler:           viewerapi.New(archive, viewerapi.Options{BearerToken: token, Syncer: syncer}),
 				ReadHeaderTimeout: 5 * time.Second,
@@ -135,6 +146,7 @@ func archiveServeCmd(options *archiveFlags) *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&listenAddress, "listen", "127.0.0.1:7878", "loopback address for the HTTP API")
+	c.Flags().StringVar(&syncCommand, "sync-command", os.Getenv("GMCLI_ARCHIVE_SYNC_COMMAND"), "trusted executable that refreshes the JSONL archive before cache refresh")
 	return c
 }
 

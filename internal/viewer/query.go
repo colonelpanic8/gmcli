@@ -95,6 +95,9 @@ const conversationColumns = `
 	COALESCE((SELECT COALESCE(m.body, '') FROM messages m WHERE m.conversation_id = c.conversation_id ORDER BY m.timestamp_ms DESC, m.message_id DESC LIMIT 1), '') AS preview`
 
 func (a *Archive) Metadata(ctx context.Context) (Meta, error) {
+	a.metadataMu.RLock()
+	formatVersion, exportedAt := a.formatVersion, a.exportedAt
+	a.metadataMu.RUnlock()
 	var conversations, messages int
 	if err := a.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM conversations`).Scan(&conversations); err != nil {
 		return Meta{}, err
@@ -102,7 +105,7 @@ func (a *Archive) Metadata(ctx context.Context) (Meta, error) {
 	if err := a.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM messages`).Scan(&messages); err != nil {
 		return Meta{}, err
 	}
-	return Meta{FormatVersion: a.formatVersion, ExportedAt: a.exportedAt, Conversations: conversations, Messages: messages, CachePath: a.cachePath}, nil
+	return Meta{FormatVersion: formatVersion, ExportedAt: exportedAt, Conversations: conversations, Messages: messages, CachePath: a.cachePath}, nil
 }
 
 func (a *Archive) ListConversations(ctx context.Context, query ConversationQuery) (ConversationPage, error) {

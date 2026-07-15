@@ -1,8 +1,9 @@
 # Archive HTTP API
 
 `gmcli archive serve` exposes the same renderer-independent query layer used by
-the archive CLI. It is read-only: the JSONL archive remains authoritative and
-SQLite/FTS5 remains a disposable derived cache.
+the archive CLI. Queries are read-only; the explicit sync endpoint runs the
+normal relay sync, atomically replaces the JSONL export, and incrementally
+refreshes the disposable SQLite/FTS5 cache. JSONL remains authoritative.
 
 ```sh
 gmcli archive serve \
@@ -27,10 +28,14 @@ responses have the shape `{"error":"..."}`, and all responses use
 | `GET /api/v1/conversations/{id}/messages` | `limit`, `before`, or `after` | Chronological message page |
 | `GET /api/v1/search` | `query`, `conversation_id`, `limit`, `offset` | Full-text search page |
 | `GET /api/v1/conversations/{id}/messages/{message_id}/context` | `before`, `after` | Exact message with surrounding context |
+| `POST /api/v1/sync` | — | Sync relay state, refresh JSONL and cache, and return new counts |
 
 Message cursors are opaque. Clients should pass `before_cursor` or
 `after_cursor` back unchanged and use `has_older`/`has_newer` to decide whether
 another page exists. `before` and `after` are mutually exclusive.
+
+Only one sync may run at a time. A concurrent request receives `409 Conflict`.
+Sync never sends a message, but it does require the paired phone to be online.
 
 `gmcli-viewer` starts this server as a private child process on a random
 loopback port with a fresh bearer token. It can instead connect to an existing

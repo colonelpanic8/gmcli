@@ -193,7 +193,8 @@ gmcli archive search '"flight details"' --dir ~/Backups/gmcli/latest
 gmcli archive messages <conv-id> --dir ~/Backups/gmcli/latest --limit 200
 gmcli archive context <conv-id> <message-id> --dir ~/Backups/gmcli/latest
 
-# Serve the same query surface over a read-only, loopback-only HTTP API.
+# Serve the same query surface over a loopback-only HTTP API. Queries are
+# read-only; POST /api/v1/sync refreshes the relay store, JSONL, and cache.
 gmcli archive serve --dir ~/Backups/gmcli/latest --listen 127.0.0.1:7878
 
 # Or launch the desktop viewer, which starts a private authenticated API child
@@ -204,9 +205,11 @@ gmcli-viewer --archive-dir ~/Backups/gmcli/latest
 `gmcli archive` is the renderer-independent query boundary for portable
 backups. Its typed query layer is shared by the table and `--json` CLI output
 and the versioned `/api/v1` HTTP surface consumed by `gmcli-viewer`. The viewer
-never reads SQLite or shells out for individual queries. JSONL remains the
-source of truth, while the derived cache is incrementally refreshed from
-manifest hashes. The default cache path is derived from the archive's absolute
+never reads SQLite or shells out for individual queries. It automatically
+pages earlier history as you scroll, and its Sync action asks the API to run
+the normal relay-sync/export/cache-refresh pipeline. JSONL remains the source
+of truth, while the derived cache is incrementally refreshed from manifest
+hashes. The default cache path is derived from the archive's absolute
 path; a cache is pinned to one archive and gmcli refuses to repurpose an
 unrelated SQLite database supplied through `--cache`. See
 [`docs/archive-api.md`](docs/archive-api.md) for the endpoint contract.
@@ -268,7 +271,7 @@ internal/
                       WaitForReady, DownloadMedia
   store/              SQLite + FTS5 store (schema v4: aliases, send cache, coverage)
   viewer/             JSONL-authoritative queries + disposable SQLite/FTS cache
-  viewerapi/          Read-only versioned HTTP adapter for viewer clients
+  viewerapi/          Versioned query and sync HTTP adapter for viewer clients
   sync/               Event-to-store pump
   output/             Shared JSON / tab-aligned table renderers
   paths/              XDG path resolution (XDG_STATE_HOME)

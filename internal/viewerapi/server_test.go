@@ -14,6 +14,17 @@ type fakeSource struct {
 	lastConversationQuery viewer.ConversationQuery
 }
 
+type fakeSyncer struct {
+	result SyncResult
+	err    error
+	calls  int
+}
+
+func (f *fakeSyncer) Sync(context.Context) (SyncResult, error) {
+	f.calls++
+	return f.result, f.err
+}
+
 func (f *fakeSource) Metadata(context.Context) (viewer.Meta, error) {
 	return viewer.Meta{Conversations: 2, Messages: 12}, nil
 }
@@ -97,5 +108,29 @@ func TestInvalidParametersAndNotFound(t *testing.T) {
 		if response.Code != test.want {
 			t.Errorf("%s: status = %d, want %d", test.path, response.Code, test.want)
 		}
+	}
+}
+
+func TestSyncEndpoint(t *testing.T) {
+	syncer := &fakeSyncer{result: SyncResult{Conversations: 500, Messages: 90_815}}
+	handler := New(&fakeSource{}, Options{Syncer: syncer})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/sync", nil))
+	if response.Code != http.StatusOK || syncer.calls != 1 {
+		t.Fatalf("status = %d, calls = %d, body = %s", response.Code, syncer.calls, response.Body.String())
+	}
+	var result SyncResult
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Messages != 90_815 {
+		t.Fatalf("result = %#v", result)
+	}
+
+	conflictSyncer := &fakeSyncer{err: ErrSyncInProgress}
+	conflict := httptest.NewRecorder()
+	New(&fakeSource{}, Options{Syncer: conflictSyncer}).ServeHTTP(conflict, httptest.NewRequest(http.MethodPost, "/api/v1/sync", nil))
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("conflict status = %d, body = %s", conflict.Code, conflict.Body.String())
 	}
 }

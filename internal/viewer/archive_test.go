@@ -139,9 +139,7 @@ func TestCacheRefreshesOnlyChangedManifestFiles(t *testing.T) {
 	if got := indexedFileTime(t, archive, "messages/Y2hhdC0x.jsonl"); got != indexedAt {
 		t.Fatalf("unchanged file was reindexed: %d != %d", got, indexedAt)
 	}
-	if err := archive.Close(); err != nil {
-		t.Fatal(err)
-	}
+	defer archive.Close()
 
 	messages := fixtureMessages()
 	messages[1].Body = stringPtr("second changed")
@@ -149,11 +147,9 @@ func TestCacheRefreshesOnlyChangedManifestFiles(t *testing.T) {
 	messages = append(messages, Message{ID: "m4", ConversationID: "chat-1", SourcePlatform: "gm", SenderID: "friend", Body: stringPtr("new"), TimestampMS: 4})
 	writeMessagesAndManifest(t, dir, messages)
 	time.Sleep(2 * time.Millisecond)
-	archive, err = Open(ctx, dir, OpenOptions{CachePath: cachePath})
-	if err != nil {
+	if err := archive.Refresh(ctx); err != nil {
 		t.Fatal(err)
 	}
-	defer archive.Close()
 	meta, err := archive.Metadata(ctx)
 	if err != nil || meta.Messages != 4 {
 		t.Fatalf("metadata after refresh = %+v, err = %v", meta, err)

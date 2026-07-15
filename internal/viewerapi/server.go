@@ -1,8 +1,9 @@
-// Package viewerapi exposes the renderer-independent archive query surface as
-// a read-only HTTP API for desktop, web, and other headless clients.
+// Package viewerapi exposes the renderer-independent archive surface as an
+// HTTP API for desktop, web, and other headless clients.
 package viewerapi
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -17,11 +18,27 @@ import (
 // Options controls access to the local archive API.
 type Options struct {
 	BearerToken string
+	Syncer      Syncer
 }
 
-// New returns a read-only HTTP handler backed by source.
+// SyncResult summarizes a successful relay sync, JSONL export, and cache refresh.
+type SyncResult struct {
+	Conversations int    `json:"conversations"`
+	Messages      int    `json:"messages"`
+	ExportedAt    string `json:"exported_at"`
+}
+
+// Syncer updates the authoritative archive behind the query source.
+type Syncer interface {
+	Sync(context.Context) (SyncResult, error)
+}
+
+// ErrSyncInProgress indicates that another client already started a sync.
+var ErrSyncInProgress = errors.New("archive sync already in progress")
+
+// New returns an HTTP handler backed by source and the optional sync action.
 func New(source viewer.Source, options Options) http.Handler {
-	api := &server{source: source, token: options.BearerToken}
+	api := &server{source: source, token: options.BearerToken, syncer: options.Syncer}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", api.health)
 	mux.HandleFunc("GET /api/v1/meta", api.metadata)
@@ -30,12 +47,16 @@ func New(source viewer.Source, options Options) http.Handler {
 	mux.HandleFunc("GET /api/v1/conversations/{conversation_id}/messages", api.messages)
 	mux.HandleFunc("GET /api/v1/conversations/{conversation_id}/messages/{message_id}/context", api.context)
 	mux.HandleFunc("GET /api/v1/search", api.search)
+	if options.Syncer != nil {
+		mux.HandleFunc("POST /api/v1/sync", api.sync)
+	}
 	return api.secure(mux)
 }
 
 type server struct {
 	source viewer.Source
 	token  string
+	syncer Syncer
 }
 
 type errorResponse struct {
@@ -61,6 +82,15 @@ func (s *server) secure(next http.Handler) http.Handler {
 
 func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *server) sync(w http.ResponseWriter, r *http.Request) {
+	value, err := s.syncer.Sync(r.Context())
+	if errors.Is(err, ErrSyncInProgress) {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeResult(w, value, err)
 }
 
 func (s *server) metadata(w http.ResponseWriter, r *http.Request) {

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fdsouvenir/gmcli/internal/store"
@@ -97,6 +98,8 @@ type Archive struct {
 	exportedAt    time.Time
 	formatVersion int
 	store         *store.Store
+	refreshMu     sync.Mutex
+	metadataMu    sync.RWMutex
 }
 
 // Meta describes the authoritative JSONL archive and its cache.
@@ -222,6 +225,25 @@ func prepareCacheIdentity(ctx context.Context, db *sql.DB, archiveRoot string, e
 
 // Close releases the disposable cache database.
 func (a *Archive) Close() error { return a.store.Close() }
+
+// Refresh verifies the current manifest and incrementally brings the
+// disposable cache up to date after the authoritative JSONL export changes.
+func (a *Archive) Refresh(ctx context.Context) error {
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	m, err := readManifest(a.dir)
+	if err != nil {
+		return err
+	}
+	if err := a.refresh(ctx, m); err != nil {
+		return err
+	}
+	a.metadataMu.Lock()
+	a.exportedAt = m.ExportedAt
+	a.formatVersion = m.FormatVersion
+	a.metadataMu.Unlock()
+	return nil
+}
 
 func readManifest(dir string) (manifest, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))

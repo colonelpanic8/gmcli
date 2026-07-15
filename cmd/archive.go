@@ -1,14 +1,18 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -25,6 +29,54 @@ type archiveFlags struct {
 	rebuild   bool
 }
 
+type archiveSyncer struct {
+	archive    *archiveview.Archive
+	archiveDir string
+	mu         sync.Mutex
+}
+
+func (s *archiveSyncer) Sync(ctx context.Context) (viewerapi.SyncResult, error) {
+	if !s.mu.TryLock() {
+		return viewerapi.SyncResult{}, viewerapi.ErrSyncInProgress
+	}
+	defer s.mu.Unlock()
+	executable, err := os.Executable()
+	if err != nil {
+		return viewerapi.SyncResult{}, fmt.Errorf("locate gmcli executable: %w", err)
+	}
+	for _, arguments := range [][]string{
+		{"sync"},
+		{"export", "jsonl", "--out", s.archiveDir, "--force"},
+	} {
+		var commandErrors bytes.Buffer
+		command := exec.CommandContext(ctx, executable, arguments...)
+		command.Stdout = os.Stderr
+		command.Stderr = io.MultiWriter(os.Stderr, &commandErrors)
+		if err := command.Run(); err != nil {
+			detail := strings.TrimSpace(commandErrors.String())
+			if len(detail) > 2_000 {
+				detail = detail[len(detail)-2_000:]
+			}
+			if detail != "" {
+				return viewerapi.SyncResult{}, fmt.Errorf("gmcli %s failed: %s", strings.Join(arguments, " "), detail)
+			}
+			return viewerapi.SyncResult{}, fmt.Errorf("gmcli %s: %w", strings.Join(arguments, " "), err)
+		}
+	}
+	if err := s.archive.Refresh(ctx); err != nil {
+		return viewerapi.SyncResult{}, fmt.Errorf("refresh archive cache: %w", err)
+	}
+	metadata, err := s.archive.Metadata(ctx)
+	if err != nil {
+		return viewerapi.SyncResult{}, fmt.Errorf("read refreshed archive metadata: %w", err)
+	}
+	return viewerapi.SyncResult{
+		Conversations: metadata.Conversations,
+		Messages:      metadata.Messages,
+		ExportedAt:    metadata.ExportedAt.Format(time.RFC3339Nano),
+	}, nil
+}
+
 func archiveCmd() *cobra.Command {
 	var options archiveFlags
 	c := &cobra.Command{Use: "archive", Short: "Query portable JSONL archives"}
@@ -39,7 +91,7 @@ func archiveServeCmd(options *archiveFlags) *cobra.Command {
 	var listenAddress string
 	c := &cobra.Command{
 		Use:   "serve",
-		Short: "Serve the read-only archive HTTP API",
+		Short: "Serve the local archive query and sync HTTP API",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			archive, err := openArchive(cmd, options)
@@ -56,8 +108,9 @@ func archiveServeCmd(options *archiveFlags) *cobra.Command {
 				return fmt.Errorf("archive API must listen on a loopback address, got %s", listener.Addr())
 			}
 			token := os.Getenv("GMCLI_ARCHIVE_API_TOKEN")
+			syncer := &archiveSyncer{archive: archive, archiveDir: options.dir}
 			server := &http.Server{
-				Handler:           viewerapi.New(archive, viewerapi.Options{BearerToken: token}),
+				Handler:           viewerapi.New(archive, viewerapi.Options{BearerToken: token, Syncer: syncer}),
 				ReadHeaderTimeout: 5 * time.Second,
 				IdleTimeout:       60 * time.Second,
 			}

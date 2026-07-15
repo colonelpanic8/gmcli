@@ -26,6 +26,12 @@ button { color: inherit; }
 .sidebar-header { padding: 24px 20px 14px; border-bottom: 1px solid var(--line); }
 .brand-row { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
 .mark { display: grid; width: 40px; height: 40px; place-items: center; border-radius: 13px; color: white; background: var(--accent); font-size: 24px; font-weight: 720; box-shadow: var(--shadow); }
+.sync-button { display: flex; margin-left: auto; align-items: center; gap: 5px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 9px; color: var(--accent); background: var(--panel-solid); cursor: pointer; font-size: 12px; font-weight: 700; }
+.sync-button:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
+.sync-button:disabled { cursor: wait; opacity: 0.65; }
+.sync-icon { display: inline-block; font-size: 16px; line-height: 1; }
+.syncing .sync-icon { animation: spin 0.8s linear infinite; }
+.brand-row p.sync-notice { color: var(--accent); }
 h1, h2, p { margin: 0; }
 h1 { font-size: 21px; letter-spacing: -0.025em; }
 .brand-row p, .thread-header p { margin-top: 3px; color: var(--muted); font-size: 12px; }
@@ -59,8 +65,8 @@ h1 { font-size: 21px; letter-spacing: -0.025em; }
 .from-me .message-meta { justify-content: flex-end; }
 .bubble { padding: 10px 13px; border: 1px solid var(--line); border-radius: 17px 17px 17px 5px; background: var(--incoming); box-shadow: 0 2px 7px rgba(46, 42, 32, 0.045); line-height: 1.42; overflow-wrap: anywhere; white-space: pre-wrap; }
 .from-me .bubble { border-color: color-mix(in srgb, var(--accent) 12%, transparent); border-radius: 17px 17px 5px 17px; background: var(--outgoing); }
-.load-older { align-self: center; margin: 2px 0 14px; padding: 8px 14px; border: 1px solid var(--line); border-radius: 999px; color: var(--accent); background: var(--panel-solid); cursor: pointer; font-size: 12px; font-weight: 650; }
-.load-older:disabled { cursor: wait; opacity: 0.55; }
+.history-progress { display: flex; align-self: center; align-items: center; gap: 7px; margin: 2px 0 14px; color: var(--accent); font-size: 11px; font-weight: 650; }
+.mini-spinner { width: 13px; height: 13px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
 .history-start { align-self: center; margin-bottom: 14px; color: var(--muted); font-size: 11px; }
 .thread-empty { display: flex; flex: 1; align-items: center; justify-content: center; flex-direction: column; gap: 9px; color: var(--muted); text-align: center; }
 .thread-empty h2 { color: var(--text); font-size: 18px; }

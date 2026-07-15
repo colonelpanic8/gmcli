@@ -238,6 +238,13 @@ struct ApiError {
     error: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct SyncResult {
+    conversations: usize,
+    messages: usize,
+    exported_at: String,
+}
+
 async fn api_get<T: DeserializeOwned>(path: &str, query: &[(&str, String)]) -> Result<T, String> {
     let config = BACKEND.get().expect("backend configured");
     let client = reqwest::Client::new();
@@ -247,7 +254,20 @@ async fn api_get<T: DeserializeOwned>(path: &str, query: &[(&str, String)]) -> R
     if let Some(token) = &config.token {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.map_err(|error| error.to_string())?;
+    decode_response(request.send().await.map_err(|error| error.to_string())?).await
+}
+
+async fn api_post<T: DeserializeOwned>(path: &str) -> Result<T, String> {
+    let config = BACKEND.get().expect("backend configured");
+    let client = reqwest::Client::new();
+    let mut request = client.post(format!("{}{}", config.base_url, path));
+    if let Some(token) = &config.token {
+        request = request.bearer_auth(token);
+    }
+    decode_response(request.send().await.map_err(|error| error.to_string())?).await
+}
+
+async fn decode_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, String> {
     let status = response.status();
     if !status.is_success() {
         let error = response
@@ -271,10 +291,17 @@ fn App() -> Element {
     let mut loading_conversations = use_signal(|| true);
     let mut loading_messages = use_signal(|| false);
     let mut loading_older = use_signal(|| false);
+    let mut syncing = use_signal(|| false);
+    let mut sync_notice = use_signal(|| None::<String>);
+    let mut refresh_nonce = use_signal(|| 0_u64);
     let mut error = use_signal(|| None::<String>);
-    let metadata = use_resource(|| async { api_get::<Meta>("/api/v1/meta", &[]).await });
+    let metadata = use_resource(move || {
+        let _ = refresh_nonce();
+        async { api_get::<Meta>("/api/v1/meta", &[]).await }
+    });
 
     use_effect(move || {
+        let _ = refresh_nonce();
         let query = filter();
         let order = sort();
         let request_query = query.clone();
@@ -317,6 +344,7 @@ fn App() -> Element {
     });
 
     use_effect(move || {
+        let _ = refresh_nonce();
         let Some(id) = selected_id() else {
             messages.set(None);
             return;
@@ -328,7 +356,7 @@ fn App() -> Element {
         spawn(async move {
             match api_get::<MessagePage>(
                 &format!("/api/v1/conversations/{}/messages", path_segment(&id)),
-                &[("limit", "200".to_owned())],
+                &[("limit", "500".to_owned())],
             )
             .await
             {
@@ -366,6 +394,39 @@ fn App() -> Element {
                                 Some(Err(_)) => rsx! { p { "Local JSONL archive" } },
                                 None => rsx! { p { "Opening local archive…" } },
                             }
+                            if let Some(notice) = sync_notice() {
+                                p { class: "sync-notice", "{notice}" }
+                            }
+                        }
+                        button {
+                            class: if syncing() { "sync-button syncing" } else { "sync-button" },
+                            disabled: syncing(),
+                            title: "Sync from Google Messages and refresh the JSONL archive",
+                            onclick: move |_| {
+                                if syncing() {
+                                    return;
+                                }
+                                syncing.set(true);
+                                sync_notice.set(None);
+                                spawn(async move {
+                                    match api_post::<SyncResult>("/api/v1/sync").await {
+                                        Ok(result) => {
+                                            sync_notice.set(Some(format!(
+                                                "Synced {} conversations · {} messages · {}",
+                                                result.conversations,
+                                                compact_count(result.messages),
+                                                sync_time(&result.exported_at),
+                                            )));
+                                            error.set(None);
+                                            refresh_nonce.set(refresh_nonce() + 1);
+                                        }
+                                        Err(message) => error.set(Some(message)),
+                                    }
+                                    syncing.set(false);
+                                });
+                            },
+                            span { class: "sync-icon", aria_hidden: "true", "↻" }
+                            if syncing() { "Syncing…" } else { "Sync" }
                         }
                     }
                     form {
@@ -425,11 +486,15 @@ fn App() -> Element {
                         page,
                         loading_older: loading_older(),
                         on_load_older: move |(id, cursor): (String, String)| {
+                            if loading_older() {
+                                return;
+                            }
                             let request_id = id.clone();
                             loading_older.set(true);
+                            capture_message_scroll_anchor();
                             spawn(async move {
                                 let result = api_get::<MessagePage>(&format!("/api/v1/conversations/{}/messages", path_segment(&id)), &[
-                                    ("before", cursor), ("limit", "200".to_owned()),
+                                    ("before", cursor), ("limit", "500".to_owned()),
                                 ]).await;
                                 if selected_id().as_deref() != Some(request_id.as_str()) {
                                     return;
@@ -445,6 +510,7 @@ fn App() -> Element {
                                             current.has_older = older.has_older;
                                             current.before_cursor = older.before_cursor;
                                             messages.set(Some(current));
+                                            restore_message_scroll_anchor();
                                         }
                                     }
                                     Err(message) => error.set(Some(message)),
@@ -508,6 +574,7 @@ fn Thread(
     let subtitle = participant_summary(&page.conversation);
     let load_id = page.conversation.conversation_id.clone();
     let load_cursor = page.before_cursor.clone();
+    let has_older = page.has_older;
     rsx! {
         header { class: "thread-header",
             div { class: "avatar thread-avatar", "{title.chars().next().unwrap_or('?').to_uppercase()}" }
@@ -520,6 +587,13 @@ fn Thread(
         section {
             class: "messages",
             aria_label: "Message history",
+            onscroll: move |event| {
+                if has_older && !loading_older && event.data().scroll_top() < 900.0
+                    && let Some(cursor) = load_cursor.clone()
+                {
+                    on_load_older.call((load_id.clone(), cursor));
+                }
+            },
             onmounted: move |_| {
                 document::eval(
                     r#"const messages = document.querySelector('.messages');
@@ -538,18 +612,9 @@ fn Thread(
                     }"#,
                 );
             },
-            if page.has_older {
-                button {
-                    class: "load-older",
-                    disabled: loading_older,
-                    onclick: move |_| {
-                        if let Some(cursor) = load_cursor.clone() {
-                            on_load_older.call((load_id.clone(), cursor));
-                        }
-                    },
-                    if loading_older { "Loading…" } else { "Load older messages" }
-                }
-            } else {
+            if loading_older {
+                div { class: "history-progress", div { class: "mini-spinner" } "Loading earlier messages…" }
+            } else if !has_older {
                 div { class: "history-start", "Beginning of archived history" }
             }
             for message in page.messages {
@@ -651,6 +716,43 @@ fn compact_count(count: usize) -> String {
     } else {
         count.to_string()
     }
+}
+
+fn sync_time(value: &str) -> String {
+    DateTime::parse_from_rfc3339(value)
+        .map(|when| when.with_timezone(&Local).format("%-I:%M %p").to_string())
+        .unwrap_or_else(|_| "just now".to_owned())
+}
+
+fn capture_message_scroll_anchor() {
+    document::eval(
+        r#"const messages = document.querySelector('.messages');
+        if (messages) {
+            window.__gmcliMessageScrollAnchor = {
+                height: messages.scrollHeight,
+                top: messages.scrollTop,
+            };
+        }"#,
+    );
+}
+
+fn restore_message_scroll_anchor() {
+    document::eval(
+        r#"let attempts = 0;
+        const restore = () => {
+            const messages = document.querySelector('.messages');
+            const anchor = window.__gmcliMessageScrollAnchor;
+            if (!messages || !anchor) return;
+            const addedHeight = messages.scrollHeight - anchor.height;
+            if (addedHeight > 0 || attempts++ >= 30) {
+                messages.scrollTop = anchor.top + Math.max(0, addedHeight);
+                delete window.__gmcliMessageScrollAnchor;
+            } else {
+                setTimeout(restore, 50);
+            }
+        };
+        requestAnimationFrame(restore);"#,
+    );
 }
 
 fn path_segment(value: &str) -> String {

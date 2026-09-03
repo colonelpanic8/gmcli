@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,6 +89,39 @@ func TestUpsertConversationIdempotent(t *testing.T) {
 	got, _ = st.GetConversation(ctx, "conv-1")
 	if got.LastMessageTimeMS != 1700000000000 {
 		t.Fatalf("last_message_ts regressed to %d", got.LastMessageTimeMS)
+	}
+}
+
+func TestUpsertConversationPreservesReusedPhoneID(t *testing.T) {
+	st := openTempStore(t)
+	ctx := context.Background()
+	oldParticipants := `[{"id":"me","e164":"+13012448534","is_me":true},{"id":"zack","e164":"+12403811729","is_me":false}]`
+	newParticipants := `[{"id":"mat","e164":"+14452217756","is_me":false},{"id":"chicken","e164":"+16176976671","is_me":false}]`
+	if err := st.UpsertConversation(ctx, store.Conversation{ID: "126", Name: "Zack", ParticipantsJSON: oldParticipants}); err != nil {
+		t.Fatal(err)
+	}
+	body := "historic"
+	if err := st.UpsertMessage(ctx, store.Message{ID: "old-message", ConversationID: "126", Body: &body, TimestampMS: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertConversation(ctx, store.Conversation{ID: "126", Name: "sibs", IsGroup: true, ParticipantsJSON: newParticipants}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := st.GetConversation(ctx, "126")
+	if err != nil || current.Name != "sibs" {
+		t.Fatalf("current conversation = %+v, err = %v", current, err)
+	}
+	message, err := st.GetMessage(ctx, "old-message")
+	if err != nil || message.ConversationID == "126" || !strings.HasPrefix(message.ConversationID, "legacy:126:") {
+		t.Fatalf("historic message = %+v, err = %v", message, err)
+	}
+	legacy, err := st.GetConversation(ctx, message.ConversationID)
+	if err != nil || legacy.Name != "Zack" || legacy.SourcePlatform != "gm-legacy" {
+		t.Fatalf("legacy conversation = %+v, err = %v", legacy, err)
+	}
+	active, err := st.ListConversationsByID(ctx)
+	if err != nil || len(active) != 1 || active[0].ID != "126" {
+		t.Fatalf("active conversations = %+v, err = %v", active, err)
 	}
 }
 

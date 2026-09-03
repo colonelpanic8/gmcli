@@ -11,6 +11,15 @@ gmcli archive serve \
   --listen 127.0.0.1:7878
 ```
 
+The same endpoints can serve the dynamic participant-reconciled view of a
+relay archive and an Android Telephony archive:
+
+```sh
+gmcli archive --dir ~/Backups/gmcli/latest unified \
+  --telephony-dir ~/Backups/gmcli/telephony \
+  serve --listen 127.0.0.1:7878
+```
+
 The listener is restricted to a loopback address. Set
 `GMCLI_ARCHIVE_API_TOKEN` before starting the server to require
 `Authorization: Bearer <token>` on every request. Responses are JSON, error
@@ -43,5 +52,7 @@ directory, after which the server verifies and incrementally refreshes its
 open cache.
 
 `gmcli-viewer` starts this server as a private child process on a random
-loopback port with a fresh bearer token. It can instead connect to an existing
-server with `gmcli-viewer --api http://127.0.0.1:7878`.
+loopback port with a fresh bearer token. Pass `--telephony-dir` (or set
+`GMCLI_TELEPHONY_ARCHIVE_DIR`) to start the unified server. It can instead
+connect to an existing server with
+`gmcli-viewer --api http://127.0.0.1:7878`.

@@ -2,7 +2,13 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -33,7 +39,33 @@ func (s *Store) UpsertConversation(ctx context.Context, c Conversation) error {
 		platform = "gm"
 	}
 	now := time.Now().UnixMilli()
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin conversation upsert: %w", err)
+	}
+	defer tx.Rollback()
+
+	existing, err := scanConversation(tx.QueryRowContext(ctx, `
+		SELECT conversation_id, source_platform, name, is_group, participants_json,
+		       last_message_ts, unread, pinned, archived, updated_at
+		  FROM conversations
+		 WHERE conversation_id = ?`, c.ID))
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read existing conversation %s: %w", c.ID, err)
+	}
+	if err == nil && conversationIdentityChanged(existing, c) {
+		var messages int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE conversation_id = ?`, c.ID).Scan(&messages); err != nil {
+			return fmt.Errorf("count messages for conversation %s: %w", c.ID, err)
+		}
+		if messages > 0 {
+			if err := preserveReusedConversationID(ctx, tx, existing); err != nil {
+				return err
+			}
+		}
+	}
+
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO conversations (
 			conversation_id, source_platform, name, is_group, participants_json,
 			last_message_ts, unread, pinned, archived, updated_at
@@ -54,6 +86,107 @@ func (s *Store) UpsertConversation(ctx context.Context, c Conversation) error {
 	)
 	if err != nil {
 		return fmt.Errorf("upsert conversation %s: %w", c.ID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit conversation %s: %w", c.ID, err)
+	}
+	return nil
+}
+
+type storedParticipant struct {
+	E164 string `json:"e164"`
+	IsMe bool   `json:"is_me"`
+}
+
+func conversationIdentityChanged(existing, incoming Conversation) bool {
+	if existing.SourcePlatform != "gm" && existing.SourcePlatform != "" {
+		return false
+	}
+	oldNumbers := participantNumbers(existing.ParticipantsJSON)
+	newNumbers := participantNumbers(incoming.ParticipantsJSON)
+	if len(oldNumbers) == 0 || len(newNumbers) == 0 {
+		return false
+	}
+	if existing.IsGroup != incoming.IsGroup {
+		return true
+	}
+	if !existing.IsGroup {
+		return strings.Join(oldNumbers, "\x00") != strings.Join(newNumbers, "\x00")
+	}
+	oldSet := make(map[string]bool, len(oldNumbers))
+	for _, number := range oldNumbers {
+		oldSet[number] = true
+	}
+	for _, number := range newNumbers {
+		if oldSet[number] {
+			return false
+		}
+	}
+	return true
+}
+
+func participantNumbers(raw string) []string {
+	var participants []storedParticipant
+	if json.Unmarshal([]byte(raw), &participants) != nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	numbers := make([]string, 0, len(participants))
+	for _, participant := range participants {
+		number := strings.TrimSpace(participant.E164)
+		if participant.IsMe || number == "" || seen[number] {
+			continue
+		}
+		seen[number] = true
+		numbers = append(numbers, number)
+	}
+	sort.Strings(numbers)
+	return numbers
+}
+
+func preserveReusedConversationID(ctx context.Context, tx *sql.Tx, existing Conversation) error {
+	digest := sha256.Sum256([]byte(existing.ID + "\x00" + existing.ParticipantsJSON))
+	legacyID := "legacy:" + existing.ID + ":" + hex.EncodeToString(digest[:8])
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO conversations (
+			conversation_id, source_platform, name, is_group, participants_json,
+			last_message_ts, unread, pinned, archived, updated_at
+		) SELECT ?, 'gm-legacy', name, is_group, participants_json,
+		         last_message_ts, unread, pinned, archived, updated_at
+		    FROM conversations WHERE conversation_id = ?`, legacyID, existing.ID); err != nil {
+		return fmt.Errorf("preserve reused conversation %s as %s: %w", existing.ID, legacyID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE messages SET conversation_id = ? WHERE conversation_id = ?`, legacyID, existing.ID); err != nil {
+		return fmt.Errorf("move messages for reused conversation %s: %w", existing.ID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO conversation_coverage (
+			conversation_id, status, history_start_ms, last_attempt_ts, last_success_ts,
+			exhausted_at, terminal_reason, last_error, last_requests,
+			last_records_fetched, updated_at
+		) SELECT ?, status, history_start_ms, last_attempt_ts, last_success_ts,
+		         exhausted_at, terminal_reason, last_error, last_requests,
+		         last_records_fetched, updated_at
+		    FROM conversation_coverage WHERE conversation_id = ?`, legacyID, existing.ID); err != nil {
+		return fmt.Errorf("preserve coverage for reused conversation %s: %w", existing.ID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO conversation_coverage_segments (conversation_id, start_ms, end_ms, verified_at)
+		SELECT ?, start_ms, end_ms, verified_at
+		  FROM conversation_coverage_segments WHERE conversation_id = ?`, legacyID, existing.ID); err != nil {
+		return fmt.Errorf("preserve coverage segments for reused conversation %s: %w", existing.ID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM conversation_coverage_segments WHERE conversation_id = ?`, existing.ID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM conversation_coverage WHERE conversation_id = ?`, existing.ID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE aliases SET target_id = ? WHERE target_type = 'conversation' AND target_id = ?`, legacyID, existing.ID); err != nil {
+		return fmt.Errorf("preserve alias for reused conversation %s: %w", existing.ID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM conversations WHERE conversation_id = ?`, existing.ID); err != nil {
+		return fmt.Errorf("replace reused conversation %s: %w", existing.ID, err)
 	}
 	return nil
 }
@@ -120,14 +253,15 @@ func (s *Store) ListConversations(ctx context.Context, opts ListConversationOpts
 	return out, rows.Err()
 }
 
-// ListConversationsByID returns the complete conversation set in stable ID
-// order. It is intended for resumable whole-archive passes, where timestamp
-// ordering and a separate count/limit query would make the cursor unstable.
+// ListConversationsByID returns active phone conversations in stable ID order.
+// Preserved fragments from a previously paired phone remain exportable but
+// cannot be requested from the current phone by their synthetic local IDs.
 func (s *Store) ListConversationsByID(ctx context.Context) ([]Conversation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT conversation_id, source_platform, name, is_group, participants_json,
 		       last_message_ts, unread, pinned, archived, updated_at
 		  FROM conversations
+		 WHERE source_platform = 'gm'
 		 ORDER BY conversation_id`)
 	if err != nil {
 		return nil, fmt.Errorf("list conversations by ID: %w", err)

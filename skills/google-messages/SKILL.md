@@ -183,6 +183,11 @@ archive when a focused query will do.
    third archive. It conservatively merges only uniquely matching cross-source
    records; unmatched records remain separate.
 
+   The desktop and HTTP viewers can use the same canonical view with
+   `gmcli archive --dir '{relay_dir}' unified --telephony-dir
+   '{telephony_dir}' serve` or `gmcli-viewer --archive-dir '{relay_dir}'
+   --telephony-dir '{telephony_dir}'`.
+
 10. **Query a portable segmented JSONL archive.** When the user supplies or
    approves an archive directory, use the `archive` commands instead of the
    live store commands. JSONL remains the source of truth; gmcli creates a

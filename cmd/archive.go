@@ -30,10 +30,15 @@ type archiveFlags struct {
 }
 
 type archiveSyncer struct {
-	archive     *archiveview.Archive
+	archive     archiveRefreshSource
 	archiveDir  string
 	syncCommand string
 	mu          sync.Mutex
+}
+
+type archiveRefreshSource interface {
+	archiveview.Source
+	Refresh(context.Context) error
 }
 
 func (s *archiveSyncer) Sync(ctx context.Context) (viewerapi.SyncResult, error) {
@@ -163,7 +168,66 @@ func archiveUnifiedCmd(options *archiveFlags) *cobra.Command {
 			"It does not write or cache a third archive.",
 	}
 	c.PersistentFlags().StringVar(&unified.telephonyDir, "telephony-dir", "", "authoritative Android Telephony archive directory (required)")
-	c.AddCommand(archiveUnifiedMetaCmd(options, &unified), archiveUnifiedConversationsCmd(options, &unified), archiveUnifiedMessagesCmd(options, &unified))
+	c.AddCommand(archiveUnifiedMetaCmd(options, &unified), archiveUnifiedConversationsCmd(options, &unified), archiveUnifiedMessagesCmd(options, &unified), archiveUnifiedServeCmd(options, &unified))
+	return c
+}
+
+func archiveUnifiedServeCmd(options *archiveFlags, unified *unifiedArchiveFlags) *cobra.Command {
+	var listenAddress string
+	var syncCommand string
+	c := &cobra.Command{
+		Use:   "serve",
+		Short: "Serve the reconciled relay and Telephony archive API",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if options.dir == "" {
+				return errors.New("--dir is required for the relay archive")
+			}
+			if unified.telephonyDir == "" {
+				return errors.New("--telephony-dir is required")
+			}
+			source, err := archiveview.OpenUnified(cmd.Context(), options.dir, unified.telephonyDir)
+			if err != nil {
+				return err
+			}
+			defer source.Close()
+			listener, err := net.Listen("tcp", listenAddress)
+			if err != nil {
+				return fmt.Errorf("listen for archive API: %w", err)
+			}
+			defer listener.Close()
+			if tcp, ok := listener.Addr().(*net.TCPAddr); !ok || !tcp.IP.IsLoopback() {
+				return fmt.Errorf("archive API must listen on a loopback address, got %s", listener.Addr())
+			}
+			token := os.Getenv("GMCLI_ARCHIVE_API_TOKEN")
+			syncer := &archiveSyncer{archive: source, archiveDir: options.dir, syncCommand: syncCommand}
+			server := &http.Server{
+				Handler:           viewerapi.New(source, viewerapi.Options{BearerToken: token, Syncer: syncer}),
+				ReadHeaderTimeout: 5 * time.Second,
+				IdleTimeout:       60 * time.Second,
+			}
+			ctx, cancel := signalContext(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				select {
+				case <-ctx.Done():
+					shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer shutdownCancel()
+					_ = server.Shutdown(shutdownCtx)
+				case <-done:
+				}
+			}()
+			defer close(done)
+			fmt.Fprintf(os.Stderr, "unified archive API listening at http://%s\n", listener.Addr())
+			if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return fmt.Errorf("serve unified archive API: %w", err)
+			}
+			return nil
+		},
+	}
+	c.Flags().StringVar(&listenAddress, "listen", "127.0.0.1:7878", "loopback address for the HTTP API")
+	c.Flags().StringVar(&syncCommand, "sync-command", os.Getenv("GMCLI_ARCHIVE_SYNC_COMMAND"), "trusted executable that refreshes the source archives before rebuilding the unified view")
 	return c
 }
 

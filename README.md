@@ -197,9 +197,15 @@ gmcli archive context <conv-id> <message-id> --dir ~/Backups/gmcli/latest
 # read-only; POST /api/v1/sync refreshes the relay store, JSONL, and cache.
 gmcli archive serve --dir ~/Backups/gmcli/latest --listen 127.0.0.1:7878
 
+# Serve the participant-reconciled relay + Android view. Device-local thread
+# IDs that represent the same people appear as one conversation.
+gmcli archive --dir ~/Backups/gmcli/latest unified \
+  --telephony-dir ~/Backups/gmcli/telephony serve --listen 127.0.0.1:7878
+
 # Or launch the desktop viewer, which starts a private authenticated API child
-# process automatically. GMCLI_ARCHIVE_DIR can supply the default archive.
-gmcli-viewer --archive-dir ~/Backups/gmcli/latest
+# process automatically. Add --telephony-dir to use that unified view.
+gmcli-viewer --archive-dir ~/Backups/gmcli/latest \
+  --telephony-dir ~/Backups/gmcli/telephony
 ```
 
 `gmcli archive` is the renderer-independent query boundary for portable

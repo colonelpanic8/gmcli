@@ -27,6 +27,7 @@ struct BackendConfig {
 struct Arguments {
     api: Option<String>,
     archive_dir: Option<PathBuf>,
+    telephony_dir: Option<PathBuf>,
     gmcli: Option<PathBuf>,
     cache: Option<PathBuf>,
 }
@@ -64,11 +65,14 @@ fn parse_arguments() -> Result<Arguments, String> {
             "--archive-dir" => {
                 parsed.archive_dir = Some(value(&mut arguments, "--archive-dir")?.into())
             }
+            "--telephony-dir" => {
+                parsed.telephony_dir = Some(value(&mut arguments, "--telephony-dir")?.into())
+            }
             "--gmcli" => parsed.gmcli = Some(value(&mut arguments, "--gmcli")?.into()),
             "--cache" => parsed.cache = Some(value(&mut arguments, "--cache")?.into()),
             "-h" | "--help" => {
                 println!(
-                    "gmcli-viewer [--archive-dir PATH] [--gmcli PATH] [--cache PATH]\n\
+                    "gmcli-viewer [--archive-dir PATH] [--telephony-dir PATH] [--gmcli PATH] [--cache PATH]\n\
                      gmcli-viewer --api URL\n\n\
                      With --api, connect to an existing archive API. Otherwise, start a private\n\
                      loopback gmcli archive server for the selected JSONL archive."
@@ -114,6 +118,15 @@ fn configure_backend(arguments: Arguments) -> Result<(BackendConfig, Option<Chil
     if let Some(cache) = arguments.cache {
         command.arg("--cache").arg(cache);
     }
+    let telephony_dir = arguments
+        .telephony_dir
+        .or_else(|| env::var_os("GMCLI_TELEPHONY_ARCHIVE_DIR").map(PathBuf::from));
+    if let Some(telephony_dir) = telephony_dir {
+        command
+            .arg("unified")
+            .arg("--telephony-dir")
+            .arg(telephony_dir);
+    }
     let mut child = command
         .arg("serve")
         .arg("--listen")
@@ -124,7 +137,7 @@ fn configure_backend(arguments: Arguments) -> Result<(BackendConfig, Option<Chil
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| format!("start {}: {error}", gmcli.display()))?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         if std::net::TcpStream::connect(&address).is_ok() {
             break;

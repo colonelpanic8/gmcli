@@ -18,6 +18,26 @@ type failedSyncClient struct {
 	opaque                                  bool
 }
 
+func (f failedSyncClient) GetConversation(id string) (*gmproto.Conversation, error) {
+	return &gmproto.Conversation{ConversationID: id}, nil
+}
+
+func TestBackfillCannotCertifyFailedPersistence(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gmcli.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.DB().Exec(`CREATE TRIGGER fail_message BEFORE INSERT ON messages BEGIN SELECT RAISE(FAIL, 'disk full'); END`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := runHistoryBackfillConnected(ctx, st, failedSyncClient{}, gmsync.New(st, zerolog.Nop()), "1", 1, 100)
+	if err == nil || !strings.Contains(err.Error(), "disk full") || result.CoverageStatus != store.CoverageFailed || result.Exhausted {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+}
+
 func (f failedSyncClient) ListContacts() (*gmproto.ListContactsResponse, error) {
 	return &gmproto.ListContactsResponse{}, f.contactError
 }

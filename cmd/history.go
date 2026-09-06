@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -198,7 +199,7 @@ func runHistoryBackfill(chat string, requests int, count int64) (historyBackfill
 	}
 	defer client.Disconnect()
 
-	return runHistoryBackfillConnected(ctx, st, client, pump, chat, requests, count)
+	return runHistoryBackfillConnected(ctx, st, client.Underlying(), pump, chat, requests, count)
 }
 
 func runHistoryBackfillAll(requests int, count int64, offset, limit int, includeExhausted bool, afterConversationID string) (historyBackfillAllResult, error) {
@@ -258,7 +259,7 @@ func runHistoryBackfillAll(requests int, count int64, offset, limit int, include
 	for i, conversation := range selected {
 		fmt.Fprintf(os.Stderr, "Backfilling selected conversation %d/%d (%s)\n", i+1, len(selected), conversation.ID)
 		result.Attempted++
-		res, err := runHistoryBackfillConnected(ctx, st, client, pump, conversation.ID, requests, count)
+		res, err := runHistoryBackfillConnected(ctx, st, client.Underlying(), pump, conversation.ID, requests, count)
 		if err != nil {
 			result.Failed++
 			result.Errors = append(result.Errors, historyBackfillError{ConversationID: conversation.ID, Error: err.Error()})
@@ -355,8 +356,13 @@ func selectHistoryBackfillConversations(conversations []store.Conversation, exha
 	return selected, eligibleCount, skippedExhausted, nil
 }
 
-func runHistoryBackfillConnected(ctx context.Context, st *store.Store, client *gm.Client, pump *gmsync.Pump, chat string, requests int, count int64) (historyBackfillResult, error) {
-	if conv, err := client.Underlying().GetConversation(chat); err == nil && conv != nil {
+type historyFetchClient interface {
+	GetConversation(string) (*gmproto.Conversation, error)
+	FetchMessages(string, int64, *gmproto.Cursor) (*gmproto.ListMessagesResponse, error)
+}
+
+func runHistoryBackfillConnected(ctx context.Context, st *store.Store, client historyFetchClient, pump *gmsync.Pump, chat string, requests int, count int64) (historyBackfillResult, error) {
+	if conv, err := client.GetConversation(chat); err == nil && conv != nil {
 		pump.Handle(conv)
 	} else if _, localErr := st.GetConversation(ctx, chat); localErr != nil {
 		if err != nil {
@@ -381,7 +387,7 @@ func runHistoryBackfillConnected(ctx context.Context, st *store.Store, client *g
 	res := historyBackfillResult{ConversationID: chat, Count: count, MessagesBefore: before, CoverageStatus: store.CoverageInProgress}
 	for i := 0; i < requests; i++ {
 		requestCursor := cursor
-		resp, err := client.Underlying().FetchMessages(chat, count, cursor)
+		resp, err := client.FetchMessages(chat, count, cursor)
 		if err != nil {
 			res.CoverageStatus, res.TerminalReason = store.CoverageFailed, "error"
 			_ = st.FinishConversationCoverage(ctx, chat, res.CoverageStatus, res.TerminalReason, nil, res.Requests, res.FetchedMessages, err.Error())
@@ -392,6 +398,13 @@ func runHistoryBackfillConnected(ctx context.Context, st *store.Store, client *g
 		res.FetchedMessages += len(msgs)
 		imported := pump.ImportMessages(ctx, msgs)
 		res.SyncRecordsProcessed += imported
+		select {
+		case err := <-pump.Fatal():
+			res.CoverageStatus, res.TerminalReason = store.CoverageFailed, "persistence_or_connection_error"
+			coverageErr := st.FinishConversationCoverage(ctx, chat, res.CoverageStatus, res.TerminalReason, nil, res.Requests, res.FetchedMessages, err.Error())
+			return res, errors.Join(err, coverageErr)
+		default:
+		}
 		next := resp.GetCursor()
 		if len(msgs) == 0 {
 			historyStart := int64(0)

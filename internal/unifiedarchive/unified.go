@@ -50,49 +50,92 @@ type Dataset struct {
 // Open verifies and dynamically unifies the two source archives without
 // writing a derived archive.
 func Open(relayDirectory, telephonyDirectory string) (*Dataset, error) {
-	if relayDirectory == "" || telephonyDirectory == "" {
+	return OpenMany([]string{relayDirectory}, []string{telephonyDirectory})
+}
+
+// OpenMany combines independent archives without interpreting their raw IDs as global.
+func OpenMany(relayDirectories, telephonyDirectories []string) (*Dataset, error) {
+	if len(relayDirectories) == 0 || len(telephonyDirectories) == 0 {
 		return nil, errors.New("relay and telephony directories are required")
 	}
-	if _, err := archive.VerifyJSONL(relayDirectory); err != nil {
-		return nil, fmt.Errorf("verify relay archive: %w", err)
+	type relayInput struct {
+		dir           string
+		manifest      relayManifest
+		conversations map[string]relayConversation
 	}
-	if _, err := androidtelephony.Verify(telephonyDirectory); err != nil {
-		return nil, fmt.Errorf("verify telephony archive: %w", err)
-	}
-	relayDir, err := filepath.Abs(relayDirectory)
-	if err != nil {
-		return nil, err
-	}
-	telephonyDir, err := filepath.Abs(telephonyDirectory)
-	if err != nil {
-		return nil, err
-	}
-	relayManifestPath := filepath.Join(relayDir, "manifest.json")
-	telephonyManifestPath := filepath.Join(telephonyDir, "manifest.json")
-	var rm relayManifest
-	if err := readJSONFile(relayManifestPath, &rm); err != nil {
-		return nil, err
-	}
-	var tm telephonyManifest
-	if err := readJSONFile(telephonyManifestPath, &tm); err != nil {
-		return nil, err
-	}
-	conversationsPath := "conversations.jsonl"
-	if entry, ok := rm.Files["conversations"]; ok && entry.Path != "" {
-		conversationsPath = entry.Path
-	}
-	relayConversations, selfE164, err := loadRelayConversations(filepath.Join(relayDir, filepath.FromSlash(conversationsPath)))
-	if err != nil {
-		return nil, err
+	var relays []relayInput
+	self := ""
+	names := make(map[string]string)
+	seen := make(map[string]bool)
+	for _, directory := range relayDirectories {
+		if directory == "" {
+			return nil, errors.New("empty relay directory")
+		}
+		dir, err := filepath.Abs(directory)
+		if err != nil {
+			return nil, err
+		}
+		if seen["gm:"+dir] {
+			continue
+		}
+		seen["gm:"+dir] = true
+		if _, err := archive.VerifyJSONL(dir); err != nil {
+			return nil, fmt.Errorf("verify relay archive %s: %w", dir, err)
+		}
+		var rm relayManifest
+		if err := readJSONFile(filepath.Join(dir, "manifest.json"), &rm); err != nil {
+			return nil, err
+		}
+		path := "conversations.jsonl"
+		if entry, ok := rm.Files["conversations"]; ok && entry.Path != "" {
+			path = entry.Path
+		}
+		conversations, number, err := loadRelayConversations(filepath.Join(dir, filepath.FromSlash(path)))
+		if err != nil {
+			return nil, err
+		}
+		if self != "" && self != number {
+			return nil, errors.New("relay archives belong to different self phone numbers")
+		}
+		self = number
+		for number, name := range relayNameLookup(conversations) {
+			names[number] = name
+		}
+		relays = append(relays, relayInput{dir, rm, conversations})
 	}
 	builds := make(map[string]*conversationBuild)
-	if err := loadRelayMessages(relayDir, rm, relayConversations, selfE164, builds); err != nil {
-		return nil, err
+	for _, input := range relays {
+		if err := loadRelayMessages(input.dir, input.manifest, input.conversations, self, builds); err != nil {
+			return nil, err
+		}
 	}
-	if err := loadTelephonyMessages(telephonyDir, tm, selfE164, relayNameLookup(relayConversations), builds); err != nil {
-		return nil, err
+	for _, directory := range telephonyDirectories {
+		if directory == "" {
+			return nil, errors.New("empty telephony directory")
+		}
+		dir, err := filepath.Abs(directory)
+		if err != nil {
+			return nil, err
+		}
+		if seen["telephony:"+dir] {
+			continue
+		}
+		seen["telephony:"+dir] = true
+		if _, err := androidtelephony.Verify(dir); err != nil {
+			return nil, fmt.Errorf("verify telephony archive %s: %w", dir, err)
+		}
+		var tm telephonyManifest
+		if err := readJSONFile(filepath.Join(dir, "manifest.json"), &tm); err != nil {
+			return nil, err
+		}
+		if err := loadTelephonyMessages(dir, tm, self, names, builds); err != nil {
+			return nil, err
+		}
 	}
-	return &Dataset{selfE164: selfE164, builds: builds}, nil
+	for _, build := range builds {
+		mergeCrossSource(build)
+	}
+	return &Dataset{selfE164: self, builds: builds}, nil
 }
 
 // Result summarizes the dynamic view.
@@ -192,12 +235,13 @@ type Participant struct {
 
 // SourceRef points back to an immutable source record.
 type SourceRef struct {
-	Platform       string `json:"platform"`
-	RecordType     string `json:"record_type"`
-	ConversationID string `json:"conversation_id,omitempty"`
-	ThreadID       string `json:"thread_id,omitempty"`
-	RecordID       string `json:"record_id"`
-	Path           string `json:"path"`
+	ArchiveDirectory string `json:"archive_directory,omitempty"`
+	Platform         string `json:"platform"`
+	RecordType       string `json:"record_type"`
+	ConversationID   string `json:"conversation_id,omitempty"`
+	ThreadID         string `json:"thread_id,omitempty"`
+	RecordID         string `json:"record_id"`
+	Path             string `json:"path"`
 }
 
 // Attachment describes source attachment metadata without embedding bytes.
@@ -293,7 +337,7 @@ func loadRelayMessages(dir string, rm relayManifest, conversations map[string]re
 			return fmt.Errorf("relay messages reference unknown conversation %q", entry.ConversationID)
 		}
 		numbers, names := relayIdentity(conversation, self)
-		canonicalID := canonicalConversationID(numbers, "relay:"+entry.ConversationID)
+		canonicalID := canonicalConversationID(numbers, "relay:"+dir+":"+entry.ConversationID)
 		build := ensureBuild(builds, canonicalID, numbers, names)
 		build.relayIDs[entry.ConversationID] = struct{}{}
 		if conversation.Name != "" {
@@ -319,7 +363,7 @@ func loadRelayMessages(dir string, rm relayManifest, conversations map[string]re
 				RecordType: "unified_message", FormatVersion: FormatVersion,
 				CanonicalConversationID: canonicalID, TimestampMS: value.TimestampMS,
 				IsFromMe: value.IsFromMe, Body: value.Body, Attachments: attachments,
-				Sources: []SourceRef{{Platform: "gm", RecordType: "message", ConversationID: entry.ConversationID, RecordID: value.MessageID, Path: entry.Path}},
+				Sources: []SourceRef{{ArchiveDirectory: dir, Platform: "gm", RecordType: "message", ConversationID: entry.ConversationID, RecordID: value.MessageID, Path: entry.Path}},
 			}
 			message.UnifiedMessageID = unifiedMessageID(canonicalID, message.Sources[0])
 			build.messages = append(build.messages, message)
@@ -399,7 +443,7 @@ func loadTelephonyMessages(dir string, tm telephonyManifest, self string, knownN
 			addTelephonyMessage(builds, numbers, knownNames, entry, Message{
 				RecordType: "unified_message", FormatVersion: FormatVersion,
 				TimestampMS: date, IsFromMe: typeValue != 1, Body: body, Attachments: []Attachment{},
-				Sources: []SourceRef{{Platform: "android_telephony", RecordType: "sms", ThreadID: entry.ThreadID, RecordID: strconv.FormatInt(id, 10), Path: entry.Path}},
+				Sources: []SourceRef{{ArchiveDirectory: dir, Platform: "android_telephony", RecordType: "sms", ThreadID: entry.ThreadID, RecordID: strconv.FormatInt(id, 10), Path: entry.Path}},
 			})
 		}
 		mmsIDs := make([]int64, 0, len(mms))
@@ -425,12 +469,9 @@ func loadTelephonyMessages(dir string, tm telephonyManifest, self string, knownN
 			addTelephonyMessage(builds, numbers, knownNames, entry, Message{
 				RecordType: "unified_message", FormatVersion: FormatVersion,
 				TimestampMS: date, IsFromMe: box != 1, Body: body, Attachments: attachments,
-				Sources: []SourceRef{{Platform: "android_telephony", RecordType: "mms", ThreadID: entry.ThreadID, RecordID: strconv.FormatInt(id, 10), Path: entry.Path}},
+				Sources: []SourceRef{{ArchiveDirectory: dir, Platform: "android_telephony", RecordType: "mms", ThreadID: entry.ThreadID, RecordID: strconv.FormatInt(id, 10), Path: entry.Path}},
 			})
 		}
-	}
-	for _, build := range builds {
-		mergeCrossSource(build)
 	}
 	return nil
 }
@@ -439,7 +480,7 @@ func addTelephonyMessage(builds map[string]*conversationBuild, numbers []string,
 	ThreadID string `json:"thread_id"`
 	Path     string `json:"path"`
 }, message Message) {
-	canonicalID := canonicalConversationID(numbers, "android-thread:"+entry.ThreadID)
+	canonicalID := canonicalConversationID(numbers, "android-thread:"+message.Sources[0].ArchiveDirectory+":"+entry.ThreadID)
 	names := make(map[string]string)
 	for _, number := range numbers {
 		if knownNames[number] != "" {
@@ -455,37 +496,44 @@ func addTelephonyMessage(builds map[string]*conversationBuild, numbers []string,
 }
 
 func mergeCrossSource(build *conversationBuild) {
-	relay := make([]Message, 0, len(build.messages))
-	telephony := make([]Message, 0, len(build.messages))
+	groups := make(map[string][]Message)
 	for _, message := range build.messages {
-		if message.Sources[0].Platform == "gm" {
-			relay = append(relay, message)
-		} else {
-			telephony = append(telephony, message)
+		source := message.Sources[0]
+		prefix := "1:"
+		if source.Platform == "gm" {
+			prefix = "0:"
+		}
+		key := prefix + source.Platform + "\x00" + source.ArchiveDirectory
+		groups[key] = append(groups[key], message)
+	}
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var merged []Message
+	for _, key := range keys {
+		candidates := groups[key]
+		sortMessages(candidates)
+		index := make(map[string][]int)
+		for i := range merged {
+			index[mergeKey(merged[i])] = append(index[mergeKey(merged[i])], i)
+		}
+		used := make(map[int]bool)
+		for _, candidate := range candidates {
+			position, ok := closestMatch(merged, index[mergeKey(candidate)], candidate.TimestampMS, used)
+			if !ok {
+				merged = append(merged, candidate)
+				continue
+			}
+			used[position] = true
+			merged[position].Sources = append(merged[position].Sources, candidate.Sources...)
+			merged[position].Attachments = appendUniqueAttachments(merged[position].Attachments, candidate.Attachments)
+			build.crossSourceMatches++
 		}
 	}
-	sortMessages(relay)
-	sortMessages(telephony)
-	index := make(map[string][]int)
-	for i := range relay {
-		key := mergeKey(relay[i])
-		index[key] = append(index[key], i)
-	}
-	used := make(map[int]bool)
-	for _, candidate := range telephony {
-		matches := index[mergeKey(candidate)]
-		position, ok := closestMatch(relay, matches, candidate.TimestampMS, used)
-		if !ok {
-			relay = append(relay, candidate)
-			continue
-		}
-		used[position] = true
-		relay[position].Sources = append(relay[position].Sources, candidate.Sources...)
-		relay[position].Attachments = appendUniqueAttachments(relay[position].Attachments, candidate.Attachments)
-		build.crossSourceMatches++
-	}
-	sortMessages(relay)
-	build.messages = relay
+	sortMessages(merged)
+	build.messages = merged
 }
 
 func closestMatch(messages []Message, positions []int, timestamp int64, used map[int]bool) (int, bool) {
@@ -658,7 +706,7 @@ func ensureBuild(builds map[string]*conversationBuild, id string, numbers []stri
 }
 
 func unifiedMessageID(canonicalID string, source SourceRef) string {
-	sum := sha256.Sum256([]byte(canonicalID + "\x00" + source.Platform + "\x00" + source.RecordType + "\x00" + source.RecordID))
+	sum := sha256.Sum256([]byte(canonicalID + "\x00" + source.ArchiveDirectory + "\x00" + source.Platform + "\x00" + source.RecordType + "\x00" + source.RecordID))
 	return hex.EncodeToString(sum[:16])
 }
 

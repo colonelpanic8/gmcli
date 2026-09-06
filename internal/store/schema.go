@@ -1,7 +1,7 @@
 package store
 
 // schemaVersion is the migration target. Bump when migrations[] grows.
-const schemaVersion = 4
+const schemaVersion = 5
 
 // migrations are applied in order. Each runs in its own transaction; the
 // store records the highest applied version in the schema_version table.
@@ -185,5 +185,13 @@ var migrations = []string{
 	) STRICT;
 
 	INSERT INTO schema_version (version) VALUES (4);
+	`,
+	// v5: a database belongs to one pairing, including its coverage and contacts.
+	`
+	CREATE TABLE source_identity (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		fingerprint TEXT NOT NULL
+	) STRICT;
+	INSERT INTO schema_version (version) VALUES (5);
 	`,
 }

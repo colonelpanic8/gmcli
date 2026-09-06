@@ -38,6 +38,20 @@ authority.
 
 ## Setup and install expectations
 
+Each live store is bound to one pairing. A changed pairing or a populated legacy
+store without a verified source identity is refused for live connections; retain
+the old archive and use a fresh `--store` for the new pairing. Numeric message
+and conversation IDs are not global across phones. `sync` returns nonzero for
+incomplete discovery, failed recent-history fetches, or persistence errors;
+`doctor --json` also returns nonzero when it reports issues.
+
+For explicitly authorized backup workflows, `android export-telephony
+--snapshot-root PATH` retains a verified, dated snapshot under the phone's
+hardware serial. It cannot be combined with `--out` or `--force`. The read-only
+`archive unified` commands accept `--additional-relay-dir` and
+`--additional-telephony-dir` for separate phone archives, preserving source
+provenance while combining conversations by participant set.
+
 This skill does not bundle message data, Google session tokens, the `gmcli`
 binary, or a sync daemon. A fresh ClawHub install should use the declared Go
 installer metadata to install `gmcli` from the gmcli release tag. The user still

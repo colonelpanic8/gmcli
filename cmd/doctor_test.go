@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +11,20 @@ import (
 
 	"github.com/fdsouvenir/gmcli/internal/store"
 )
+
+func TestDoctorJSONFailsForUnverifiedDiscovery(t *testing.T) {
+	oldFlags := flags
+	t.Cleanup(func() { flags = oldFlags })
+	flags = globalFlags{storeDir: t.TempDir(), jsonOut: true, readOnly: true}
+	report := runDoctor(context.Background())
+	if !strings.Contains(strings.Join(report.Issues, "\n"), "no folder discovery") {
+		t.Fatalf("issues=%v", report.Issues)
+	}
+	command := doctorCmd()
+	if err := command.RunE(command, nil); err == nil {
+		t.Fatal("JSON doctor reported success despite issues")
+	}
+}
 
 func TestRunDoctorReportsLastSyncActivityTime(t *testing.T) {
 	oldFlags := flags

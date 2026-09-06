@@ -17,17 +17,22 @@ import (
 // Unified provides the normal viewer query surface over the dynamically
 // reconciled relay and Android Telephony archives.
 type Unified struct {
-	relayDir     string
-	telephonyDir string
-	mu           sync.RWMutex
-	dataset      *unifiedarchive.Dataset
-	exportedAt   time.Time
+	relayDirs     []string
+	telephonyDirs []string
+	mu            sync.RWMutex
+	dataset       *unifiedarchive.Dataset
+	exportedAt    time.Time
 }
 
 // OpenUnified verifies both archives and builds their canonical participant
 // view in memory.
 func OpenUnified(ctx context.Context, relayDir, telephonyDir string) (*Unified, error) {
-	u := &Unified{relayDir: relayDir, telephonyDir: telephonyDir}
+	return OpenUnifiedMany(ctx, []string{relayDir}, []string{telephonyDir})
+}
+
+// OpenUnifiedMany combines independently scoped phone archives.
+func OpenUnifiedMany(ctx context.Context, relayDirs, telephonyDirs []string) (*Unified, error) {
+	u := &Unified{relayDirs: append([]string(nil), relayDirs...), telephonyDirs: append([]string(nil), telephonyDirs...)}
 	if err := u.Refresh(ctx); err != nil {
 		return nil, err
 	}
@@ -42,13 +47,19 @@ func (u *Unified) Refresh(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	dataset, err := unifiedarchive.Open(u.relayDir, u.telephonyDir)
+	dataset, err := unifiedarchive.OpenMany(u.relayDirs, u.telephonyDirs)
 	if err != nil {
 		return err
 	}
-	exportedAt, err := relayExportedAt(u.relayDir)
-	if err != nil {
-		return err
+	var exportedAt time.Time
+	for _, dir := range u.relayDirs {
+		timestamp, err := relayExportedAt(dir)
+		if err != nil {
+			return err
+		}
+		if timestamp.After(exportedAt) {
+			exportedAt = timestamp
+		}
 	}
 	u.mu.Lock()
 	u.dataset = dataset

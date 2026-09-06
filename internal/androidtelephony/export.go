@@ -32,25 +32,28 @@ type Options struct {
 	OutputDirectory string
 	Force           bool
 	IncludePartData bool
+	hardwareSerial  string
 }
 
 // Result describes an installed, checksummed Telephony export.
 type Result struct {
-	Path          string `json:"path"`
-	Threads       int    `json:"threads"`
-	Records       int    `json:"records"`
-	MediaFiles    int    `json:"media_files"`
-	MediaBytes    int64  `json:"media_bytes"`
-	DeviceSerial  string `json:"device_serial"`
-	FormatVersion int    `json:"format_version"`
+	Path           string `json:"path"`
+	Threads        int    `json:"threads"`
+	Records        int    `json:"records"`
+	MediaFiles     int    `json:"media_files"`
+	MediaBytes     int64  `json:"media_bytes"`
+	DeviceSerial   string `json:"device_serial"`
+	HardwareSerial string `json:"hardware_serial,omitempty"`
+	FormatVersion  int    `json:"format_version"`
 }
 
 type manifest struct {
-	Format        string         `json:"format"`
-	FormatVersion int            `json:"format_version"`
-	DeviceSerial  string         `json:"device_serial"`
-	Files         []manifestFile `json:"files"`
-	Threads       []threadFile   `json:"threads"`
+	Format         string         `json:"format"`
+	FormatVersion  int            `json:"format_version"`
+	DeviceSerial   string         `json:"device_serial"`
+	HardwareSerial string         `json:"hardware_serial,omitempty"`
+	Files          []manifestFile `json:"files"`
+	Threads        []threadFile   `json:"threads"`
 }
 
 type manifestFile struct {
@@ -144,6 +147,8 @@ func Export(ctx context.Context, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	archiveManifest.HardwareSerial = options.hardwareSerial
+	result.HardwareSerial = options.hardwareSerial
 	if err := writeManifest(filepath.Join(tmp, "manifest.json"), archiveManifest); err != nil {
 		return Result{}, err
 	}

@@ -54,7 +54,7 @@ func (s *Store) UpsertMessage(ctx context.Context, m Message) error {
 	`, m.ConversationID, platform, now); err != nil {
 		return fmt.Errorf("ensure conversation %s: %w", m.ConversationID, err)
 	}
-	_, err := s.db.ExecContext(ctx, `
+	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO messages (
 			message_id, conversation_id, source_platform, sender_id,
 			body, timestamp_ms, status, is_from_me,
@@ -76,6 +76,8 @@ func (s *Store) UpsertMessage(ctx context.Context, m Message) error {
 			reply_to_id     = excluded.reply_to_id,
 			raw_proto       = excluded.raw_proto,
 			updated_at      = excluded.updated_at
+		WHERE messages.conversation_id = excluded.conversation_id
+		  AND messages.timestamp_ms = excluded.timestamp_ms
 	`,
 		m.ID, m.ConversationID, platform, m.SenderID,
 		m.Body, m.TimestampMS, m.Status, boolToInt(m.IsFromMe),
@@ -84,6 +86,11 @@ func (s *Store) UpsertMessage(ctx context.Context, m Message) error {
 	)
 	if err != nil {
 		return fmt.Errorf("upsert message %s: %w", m.ID, err)
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return fmt.Errorf("message ID %s was reused with a different conversation or timestamp; refusing to overwrite archived content; sync into a new --store directory", m.ID)
 	}
 	return nil
 }

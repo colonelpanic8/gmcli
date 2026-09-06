@@ -107,6 +107,7 @@ func (p *Pump) ImportContacts(ctx context.Context, contacts []*gmproto.Contact) 
 			AvatarColor:     c.GetAvatarHexColor(),
 		}
 		if err := p.store.UpsertContact(ctx, row); err != nil {
+			p.fail(err)
 			p.logger.Error().Err(err).Str("participant_id", row.ParticipantID).Msg("Upsert contact failed")
 			continue
 		}
@@ -158,6 +159,7 @@ func (p *Pump) onConversation(ctx context.Context, c *gmproto.Conversation) {
 		Pinned:            c.GetPinned(),
 	}
 	if err := p.store.UpsertConversation(ctx, row); err != nil {
+		p.fail(err)
 		p.logger.Error().Err(err).Str("conv_id", row.ID).Msg("Upsert conversation failed")
 		return
 	}
@@ -190,6 +192,7 @@ func (p *Pump) upsertParticipant(ctx context.Context, part *gmproto.Participant)
 		IsMe:            part.GetIsMe(),
 	}
 	if err := p.store.UpsertContact(ctx, row); err != nil {
+		p.fail(err)
 		p.logger.Error().Err(err).Str("participant_id", pid).Msg("Upsert participant failed")
 	}
 }
@@ -228,11 +231,14 @@ func (p *Pump) onMessage(ctx context.Context, w *libgm.WrappedMessage) {
 		row.DecryptionKey = media.GetDecryptionKey()
 	}
 	if err := p.store.UpsertMessage(ctx, row); err != nil {
+		p.fail(err)
 		p.logger.Error().Err(err).Str("msg_id", row.ID).Msg("Upsert message failed")
 		return
 	}
 	if !w.IsOld {
-		_ = p.store.MarkSync(ctx, time.UnixMilli(row.TimestampMS), time.Now())
+		if err := p.store.MarkSync(ctx, time.UnixMilli(row.TimestampMS), time.Now()); err != nil {
+			p.fail(err)
+		}
 	}
 }
 
@@ -246,12 +252,14 @@ func (p *Pump) onSettings(ctx context.Context, settings *gmproto.Settings) {
 		return
 	}
 	if err := p.store.SavePhoneSettings(ctx, raw, len(settings.GetSIMCards())); err != nil {
+		p.fail(err)
 		p.logger.Error().Err(err).Msg("Save phone settings failed")
 	}
 }
 
 func (p *Pump) touch(ctx context.Context) {
 	if err := p.store.MarkSync(ctx, time.Time{}, time.Now()); err != nil {
+		p.fail(err)
 		p.logger.Debug().Err(err).Msg("MarkSync failed")
 	}
 }

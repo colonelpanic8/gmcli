@@ -102,108 +102,10 @@ func syncCmd() *cobra.Command {
 			}
 			defer client.Disconnect()
 
-			if resp, err := client.Underlying().ListContacts(); err != nil {
-				logger.Warn().Err(err).Msg("Contact import failed")
-			} else {
-				imported := pump.ImportContacts(ctx, resp.GetContacts())
-				logger.Info().Int("contacts", imported).Msg("Imported contacts")
+			if err := runInitialSync(ctx, client.Underlying(), st, pump, logger, conversationLimit, includeSpam, includeArchive); err != nil {
+				return err
 			}
-
-			folders := []gmproto.ListConversationsRequest_Folder{
-				gmproto.ListConversationsRequest_INBOX,
-			}
-			if includeSpam {
-				folders = append(folders, gmproto.ListConversationsRequest_SPAM_BLOCKED)
-			}
-			// Archive is last because some phone versions do not answer this
-			// folder request; the per-page timeout keeps sync bounded.
-			if includeArchive {
-				folders = append(folders, gmproto.ListConversationsRequest_ARCHIVE)
-			}
-			conversations := make(map[string]*gmproto.Conversation)
-			recentConversationIDs := make([]string, 0, 50)
-			for _, folder := range folders {
-				folderName := folder.String()
-				if err := st.StartFolderCoverage(ctx, folderName); err != nil {
-					return fmt.Errorf("start %s coverage: %w", folderName, err)
-				}
-				var cursor *gmproto.Cursor
-				serverPageSize := 0
-				folderStatus, terminalReason, folderError := store.CoveragePartial, "page_budget", ""
-				for page := 1; page <= maxConversationPages; page++ {
-					resp, err := listConversationPage(ctx, client.Underlying(), conversationLimit, folder, cursor, conversationFolderTimeout)
-					if err != nil {
-						logger.Warn().Err(err).Str("folder", folder.String()).Int("page", page).Msg("Conversation folder import stopped")
-						folderStatus, terminalReason, folderError = store.CoverageFailed, "error", err.Error()
-						break
-					}
-					pageConversations := 0
-					for _, conv := range resp.GetConversations() {
-						if conv == nil || conv.GetConversationID() == "" {
-							continue
-						}
-						id := conv.GetConversationID()
-						if _, exists := conversations[id]; !exists && folder == gmproto.ListConversationsRequest_INBOX && len(recentConversationIDs) < 50 {
-							recentConversationIDs = append(recentConversationIDs, id)
-						}
-						conversations[id] = conv
-						pump.Handle(conv) // Persist every page before requesting the next one.
-						pageConversations++
-					}
-					logger.Info().Str("folder", folder.String()).Int("page", page).Int("conversations", pageConversations).Msg("Discovered conversation page")
-					if err := st.RecordFolderCoveragePage(ctx, folderName, pageConversations); err != nil {
-						return fmt.Errorf("record %s coverage page: %w", folderName, err)
-					}
-					if page == 1 {
-						serverPageSize = pageConversations
-					} else if pageConversations < serverPageSize {
-						// Google still returns a cursor on the final, short page.
-						folderStatus, terminalReason = store.CoverageComplete, "short_page"
-						break
-					}
-					next := resp.GetCursor()
-					if next == nil {
-						if len(resp.GetCursorBytes()) > 0 {
-							logger.Warn().Str("folder", folder.String()).Msg("Conversation response has an opaque cursor that this protocol version cannot continue")
-							folderStatus, terminalReason = store.CoveragePartial, "opaque_cursor"
-						} else {
-							folderStatus, terminalReason = store.CoverageComplete, "no_cursor"
-						}
-						break
-					}
-					if pageConversations == 0 {
-						folderStatus, terminalReason = store.CoverageComplete, "empty_page"
-						break
-					}
-					if sameCursor(cursor, next) {
-						folderStatus, terminalReason = store.CoveragePartial, "same_cursor"
-						break
-					}
-					cursor = next
-				}
-				if err := st.FinishFolderCoverage(ctx, folderName, folderStatus, terminalReason, folderError); err != nil {
-					return fmt.Errorf("finish %s coverage: %w", folderName, err)
-				}
-			}
-			msgs := 0
-			for _, id := range recentConversationIDs {
-				if history, err := client.Underlying().FetchMessages(id, 10, nil); err != nil {
-					logger.Debug().Err(err).Str("conversation_id", id).Msg("Recent message import failed")
-				} else {
-					msgs += pump.ImportMessages(ctx, history.GetMessages())
-				}
-			}
-			convs := len(conversations)
-			if convs > 0 {
-				logger.Info().Int("conversations", convs).Int("messages", msgs).Msg("Imported recent conversation history")
-			}
-
 			if !follow {
-				select {
-				case err := <-pump.Fatal():
-					return err
-				default:
-				}
 				fmt.Fprintln(os.Stderr, "Initial sync complete. Pass --follow to stay connected.")
 				return nil
 			}
@@ -232,6 +134,133 @@ func syncCmd() *cobra.Command {
 	c.Flags().BoolVar(&includeArchive, "include-archive", true, "discover conversations in Archive in addition to Inbox")
 	c.AddCommand(syncSendSettingsCmd())
 	return c
+}
+
+type initialSyncClient interface {
+	conversationListClient
+	ListContacts() (*gmproto.ListContactsResponse, error)
+	FetchMessages(string, int64, *gmproto.Cursor) (*gmproto.ListMessagesResponse, error)
+}
+
+func runInitialSync(ctx context.Context, client initialSyncClient, st *store.Store, pump *gmsync.Pump, logger zerolog.Logger, conversationLimit int, includeSpam, includeArchive bool) error {
+	var syncErrors []error
+	if resp, err := client.ListContacts(); err != nil {
+		logger.Warn().Err(err).Msg("Contact import failed")
+		syncErrors = append(syncErrors, fmt.Errorf("contact import: %w", err))
+	} else {
+		imported := pump.ImportContacts(ctx, resp.GetContacts())
+		logger.Info().Int("contacts", imported).Msg("Imported contacts")
+	}
+
+	folders := []gmproto.ListConversationsRequest_Folder{
+		gmproto.ListConversationsRequest_INBOX,
+	}
+	if includeSpam {
+		folders = append(folders, gmproto.ListConversationsRequest_SPAM_BLOCKED)
+	}
+	// Archive is last because some phone versions do not answer this
+	// folder request; the per-page timeout keeps sync bounded.
+	if includeArchive {
+		folders = append(folders, gmproto.ListConversationsRequest_ARCHIVE)
+	}
+	conversations := make(map[string]*gmproto.Conversation)
+	recentConversationIDs := make([]string, 0, 50)
+	for _, folder := range folders {
+		folderName := folder.String()
+		if err := st.StartFolderCoverage(ctx, folderName); err != nil {
+			return fmt.Errorf("start %s coverage: %w", folderName, err)
+		}
+		var cursor *gmproto.Cursor
+		serverPageSize := 0
+		folderStatus, terminalReason, folderError := store.CoveragePartial, "page_budget", ""
+		for page := 1; page <= maxConversationPages; page++ {
+			resp, err := listConversationPage(ctx, client, conversationLimit, folder, cursor, conversationFolderTimeout)
+			if err != nil {
+				logger.Warn().Err(err).Str("folder", folder.String()).Int("page", page).Msg("Conversation folder import stopped")
+				folderStatus, terminalReason, folderError = store.CoverageFailed, "error", err.Error()
+				break
+			}
+			pageConversations := 0
+			for _, conv := range resp.GetConversations() {
+				if conv == nil || conv.GetConversationID() == "" {
+					continue
+				}
+				id := conv.GetConversationID()
+				if _, exists := conversations[id]; !exists && folder == gmproto.ListConversationsRequest_INBOX && len(recentConversationIDs) < 50 {
+					recentConversationIDs = append(recentConversationIDs, id)
+				}
+				conversations[id] = conv
+				pump.Handle(conv) // Persist every page before requesting the next one.
+				pageConversations++
+			}
+			logger.Info().Str("folder", folder.String()).Int("page", page).Int("conversations", pageConversations).Msg("Discovered conversation page")
+			if err := st.RecordFolderCoveragePage(ctx, folderName, pageConversations); err != nil {
+				return fmt.Errorf("record %s coverage page: %w", folderName, err)
+			}
+			if page == 1 {
+				serverPageSize = pageConversations
+			} else if pageConversations < serverPageSize {
+				// Google still returns a cursor on the final, short page.
+				folderStatus, terminalReason = store.CoverageComplete, "short_page"
+				break
+			}
+			next := resp.GetCursor()
+			if next == nil {
+				if len(resp.GetCursorBytes()) > 0 {
+					logger.Warn().Str("folder", folder.String()).Msg("Conversation response has an opaque cursor that this protocol version cannot continue")
+					folderStatus, terminalReason = store.CoveragePartial, "opaque_cursor"
+				} else {
+					folderStatus, terminalReason = store.CoverageComplete, "no_cursor"
+				}
+				break
+			}
+			if pageConversations == 0 {
+				folderStatus, terminalReason = store.CoverageComplete, "empty_page"
+				break
+			}
+			if sameCursor(cursor, next) {
+				folderStatus, terminalReason = store.CoveragePartial, "same_cursor"
+				break
+			}
+			cursor = next
+		}
+		if err := st.FinishFolderCoverage(ctx, folderName, folderStatus, terminalReason, folderError); err != nil {
+			return fmt.Errorf("finish %s coverage: %w", folderName, err)
+		}
+		if err := folderSyncError(folderName, folderStatus, terminalReason, folderError); err != nil {
+			syncErrors = append(syncErrors, err)
+		}
+	}
+	msgs := 0
+	for _, id := range recentConversationIDs {
+		if history, err := client.FetchMessages(id, 10, nil); err != nil {
+			logger.Debug().Err(err).Str("conversation_id", id).Msg("Recent message import failed")
+			syncErrors = append(syncErrors, fmt.Errorf("recent messages for %s: %w", id, err))
+		} else {
+			msgs += pump.ImportMessages(ctx, history.GetMessages())
+		}
+	}
+	convs := len(conversations)
+	if convs > 0 {
+		logger.Info().Int("conversations", convs).Int("messages", msgs).Msg("Imported recent conversation history")
+	}
+
+	select {
+	case err := <-pump.Fatal():
+		syncErrors = append(syncErrors, err)
+	default:
+	}
+	if err := errors.Join(syncErrors...); err != nil {
+		return fmt.Errorf("initial sync incomplete: %w", err)
+	}
+	return nil
+}
+
+func folderSyncError(folder, status, reason, detail string) error {
+	if status == store.CoverageComplete {
+		return nil
+	}
+	return fmt.Errorf("%s discovery %s (%s): %s", folder, status, reason, detail)
 }
 
 func listConversationPage(ctx context.Context, client conversationListClient, count int, folder gmproto.ListConversationsRequest_Folder, cursor *gmproto.Cursor, timeout time.Duration) (*gmproto.ListConversationsResponse, error) {

@@ -89,6 +89,36 @@ func testMessage(id string, timestamp int64, fromMe bool, body *string, source S
 
 func stringPointer(value string) *string { return &value }
 
+func TestMultiplePhonesReuseIDsWithoutLosingMessages(t *testing.T) {
+	build := testBuild("e164:+12025550101")
+	for _, archive := range []string{"phone-a", "phone-b", "phone-c"} {
+		for i, timestamp := range []int64{10000, 11000, 30000} {
+			source := SourceRef{ArchiveDirectory: archive, Platform: "gm", RecordType: "message", RecordID: string(rune('1' + i))}
+			body := "repeated text"
+			if i == 2 {
+				body = archive
+			}
+			build.messages = append(build.messages, testMessage(build.id, timestamp, false, &body, source))
+		}
+	}
+	ids := map[string]bool{}
+	for _, message := range build.messages {
+		if ids[message.UnifiedMessageID] {
+			t.Fatal("raw IDs collided across archives")
+		}
+		ids[message.UnifiedMessageID] = true
+	}
+	mergeCrossSource(build)
+	if len(build.messages) != 5 || build.crossSourceMatches != 4 {
+		t.Fatalf("messages=%d matches=%d", len(build.messages), build.crossSourceMatches)
+	}
+	for _, message := range build.messages[:2] {
+		if len(message.Sources) != 3 {
+			t.Fatalf("lost source provenance: %#v", message.Sources)
+		}
+	}
+}
+
 func taggedValues(values map[string]any) map[string]taggedValue {
 	out := make(map[string]taggedValue, len(values))
 	for key, value := range values {

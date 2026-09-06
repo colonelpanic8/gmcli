@@ -36,8 +36,8 @@ func TestOpenMigratesFreshDB(t *testing.T) {
 	if state.LastEventTime.UnixMilli() != 0 || state.LastConnectTime.UnixMilli() != 0 {
 		t.Fatalf("expected unset (epoch) sync timestamps, got %+v", state)
 	}
-	if v, err := st.SchemaVersion(ctx); err != nil || v != 4 {
-		t.Fatalf("schema version: got %d err=%v, want 4", v, err)
+	if v, err := st.SchemaVersion(ctx); err != nil || v != 5 {
+		t.Fatalf("schema version: got %d err=%v, want 5", v, err)
 	}
 }
 
@@ -142,7 +142,7 @@ func TestUpsertMessageAndFTSRoundTrip(t *testing.T) {
 	}
 	must(st.UpsertMessage(ctx, store.Message{
 		ID: "m1", ConversationID: "conv-1", Body: &body1,
-		TimestampMS: time.Now().UnixMilli(),
+		TimestampMS: 1700000000000,
 	}))
 	must(st.UpsertMessage(ctx, store.Message{
 		ID: "m2", ConversationID: "conv-1", Body: &body2,
@@ -176,7 +176,7 @@ func TestUpsertMessageAndFTSRoundTrip(t *testing.T) {
 	// Idempotent re-upsert (same id).
 	must(st.UpsertMessage(ctx, store.Message{
 		ID: "m1", ConversationID: "conv-1", Body: &body1,
-		TimestampMS: time.Now().UnixMilli(),
+		TimestampMS: 1700000000000,
 	}))
 	hits, _ = st.SearchMessages(ctx, "dinner", 10)
 	if len(hits) != 3 {

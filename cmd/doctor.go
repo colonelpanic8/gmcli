@@ -52,9 +52,12 @@ func doctorCmd() *cobra.Command {
 			if flags.jsonOut {
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetIndent("", "  ")
-				return enc.Encode(report)
+				if err := enc.Encode(report); err != nil {
+					return err
+				}
+			} else {
+				renderDoctor(report)
 			}
-			renderDoctor(report)
 			if len(report.Issues) > 0 {
 				return fmt.Errorf("%d issue(s) detected", len(report.Issues))
 			}
@@ -115,6 +118,17 @@ func runDoctor(ctx context.Context) doctorReport {
 		r.LastEventTime = state.LastEventTime
 		r.LastConnectTime = state.LastConnectTime
 		r.LastSyncActivityTime = state.UpdatedAt
+	}
+	if folders, err := st.ListFolderCoverage(ctx); err != nil {
+		r.Issues = append(r.Issues, fmt.Sprintf("read folder coverage: %v", err))
+	} else if len(folders) == 0 {
+		r.Issues = append(r.Issues, "no folder discovery has been verified; pairing alone does not establish backup freshness")
+	} else {
+		for _, folder := range folders {
+			if err := folderSyncError(folder.Folder, folder.Status, folder.TerminalReason, folder.LastError); err != nil {
+				r.Issues = append(r.Issues, err.Error())
+			}
+		}
 	}
 	settings, err := st.LatestPhoneSettings(ctx)
 	switch {

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -156,7 +157,9 @@ func archiveServeCmd(options *archiveFlags) *cobra.Command {
 }
 
 type unifiedArchiveFlags struct {
-	telephonyDir string
+	telephonyDir        string
+	additionalRelays    []string
+	additionalTelephony []string
 }
 
 func archiveUnifiedCmd(options *archiveFlags) *cobra.Command {
@@ -168,6 +171,8 @@ func archiveUnifiedCmd(options *archiveFlags) *cobra.Command {
 			"It does not write or cache a third archive.",
 	}
 	c.PersistentFlags().StringVar(&unified.telephonyDir, "telephony-dir", "", "authoritative Android Telephony archive directory (required)")
+	c.PersistentFlags().StringSliceVar(&unified.additionalRelays, "additional-relay-dir", filepath.SplitList(os.Getenv("GMCLI_ADDITIONAL_RELAY_DIRS")), "additional independent relay archives")
+	c.PersistentFlags().StringSliceVar(&unified.additionalTelephony, "additional-telephony-dir", filepath.SplitList(os.Getenv("GMCLI_ADDITIONAL_TELEPHONY_DIRS")), "additional independent Telephony archives")
 	c.AddCommand(archiveUnifiedMetaCmd(options, &unified), archiveUnifiedConversationsCmd(options, &unified), archiveUnifiedMessagesCmd(options, &unified), archiveUnifiedServeCmd(options, &unified))
 	return c
 }
@@ -186,7 +191,7 @@ func archiveUnifiedServeCmd(options *archiveFlags, unified *unifiedArchiveFlags)
 			if unified.telephonyDir == "" {
 				return errors.New("--telephony-dir is required")
 			}
-			source, err := archiveview.OpenUnified(cmd.Context(), options.dir, unified.telephonyDir)
+			source, err := archiveview.OpenUnifiedMany(cmd.Context(), append([]string{options.dir}, unified.additionalRelays...), append([]string{unified.telephonyDir}, unified.additionalTelephony...))
 			if err != nil {
 				return err
 			}
@@ -238,7 +243,7 @@ func openUnifiedArchive(options *archiveFlags, unified *unifiedArchiveFlags) (*u
 	if unified.telephonyDir == "" {
 		return nil, errors.New("--telephony-dir is required")
 	}
-	return unifiedarchive.Open(options.dir, unified.telephonyDir)
+	return unifiedarchive.OpenMany(append([]string{options.dir}, unified.additionalRelays...), append([]string{unified.telephonyDir}, unified.additionalTelephony...))
 }
 
 func archiveUnifiedMetaCmd(options *archiveFlags, unified *unifiedArchiveFlags) *cobra.Command {

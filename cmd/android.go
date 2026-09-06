@@ -76,7 +76,7 @@ func androidVerifyTelephonyCmd() *cobra.Command {
 }
 
 func androidExportTelephonyCmd() *cobra.Command {
-	var out, adb, serial string
+	var out, adb, serial, snapshotRoot string
 	var force, includePartData bool
 	c := &cobra.Command{
 		Use:   "export-telephony",
@@ -85,16 +85,23 @@ func androidExportTelephonyCmd() *cobra.Command {
 			"The result has one JSONL file per Telephony thread, complete type-tagged provider rows, " +
 			"MMS participants, canonical addresses, and content-addressed MMS attachments with SHA-256 checksums.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if out == "" {
-				return fmt.Errorf("--out is required")
+			if out == "" && snapshotRoot == "" {
+				return fmt.Errorf("--out or --snapshot-root is required")
 			}
-			result, err := androidtelephony.Export(cmd.Context(), androidtelephony.Options{
+			options := androidtelephony.Options{
 				ADB:             adb,
 				Serial:          serial,
 				OutputDirectory: out,
 				Force:           force,
 				IncludePartData: includePartData,
-			})
+			}
+			var result androidtelephony.Result
+			var err error
+			if snapshotRoot != "" {
+				result, err = androidtelephony.Snapshot(cmd.Context(), options, snapshotRoot)
+			} else {
+				result, err = androidtelephony.Export(cmd.Context(), options)
+			}
 			if err != nil {
 				return err
 			}
@@ -106,7 +113,8 @@ func androidExportTelephonyCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&out, "out", "", "destination archive directory (required)")
+	c.Flags().StringVar(&out, "out", "", "destination archive directory (or use --snapshot-root)")
+	c.Flags().StringVar(&snapshotRoot, "snapshot-root", "", "retain a dated snapshot under this root and the hardware serial; exclusive with --out/--force")
 	c.Flags().StringVar(&adb, "adb", "adb", "adb executable")
 	c.Flags().StringVar(&serial, "serial", "", "adb device serial (auto-detected when exactly one device is connected)")
 	c.Flags().BoolVar(&force, "force", false, "atomically replace an existing output directory")

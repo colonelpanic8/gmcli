@@ -16,6 +16,7 @@ package gm
 import (
 	"context"
 	"crypto/elliptic"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/fdsouvenir/gmcli/internal/paths"
+	"github.com/fdsouvenir/gmcli/internal/store"
 )
 
 // PairTimeout is the upper bound on how long we wait for a phone to scan the
@@ -94,9 +96,18 @@ func Open(layout paths.Layout, logger zerolog.Logger) (*Client, error) {
 		layout: layout,
 		logger: logger,
 	}
-	c.libgm = libgm.NewClient(auth, nil, logger)
+	c.libgm = libgm.NewClient(auth, nil, logger.Hook(decodeFailureHook{notify: c.dispatch}))
 	c.libgm.SetEventHandler(c.dispatch)
 	return c, nil
+}
+
+// libgm currently logs decode failures without delivering an error event.
+type decodeFailureHook struct{ notify EventHandler }
+
+func (h decodeFailureHook) Run(_ *zerolog.Event, level zerolog.Level, message string) {
+	if level == zerolog.ErrorLevel && message == "Failed to decode incoming RPC message" {
+		h.notify(&events.ListenFatalError{Error: errors.New("relay event could not be decrypted or decoded; refresh the pairing before retrying sync")})
+	}
 }
 
 // Subscribe registers a handler. Multiple subscribers receive each event in
@@ -111,10 +122,48 @@ func (c *Client) Subscribe(h EventHandler) {
 // immediately. Returns when the initial sync completes; the connection
 // continues running in a background goroutine inside libgm.
 func (c *Client) Connect() error {
+	if err := c.bindSource(); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	c.ready = false
 	c.mu.Unlock()
 	return c.libgm.Connect()
+}
+
+func (c *Client) bindSource() error {
+	fingerprint, err := pairingFingerprint(c.auth)
+	if err != nil {
+		return err
+	}
+	if c.layout.Database == "" {
+		return errors.New("database path is required before connecting")
+	}
+	st, err := store.Open(context.Background(), c.layout.Database)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	return st.BindSource(context.Background(), fingerprint)
+}
+
+func pairingFingerprint(auth *libgm.AuthData) (string, error) {
+	if auth == nil || auth.Mobile == nil || auth.Mobile.GetSourceID() == "" {
+		return "", errors.New("session has no paired phone identity; pair into a new --store directory")
+	}
+	pairing := auth.PairingID
+	if pairing == uuid.Nil {
+		pairing = auth.SessionID
+	}
+	if pairing == uuid.Nil {
+		return "", errors.New("session has no pairing identity; pair into a new --store directory")
+	}
+	mobile, err := proto.MarshalOptions{Deterministic: true}.Marshal(auth.Mobile)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(append([]byte(pairing.String()+"\x00"), mobile...))
+	return fmt.Sprintf("gm-pairing:%x", digest), nil
 }
 
 // Disconnect closes the long-poll and persists the final in-memory auth

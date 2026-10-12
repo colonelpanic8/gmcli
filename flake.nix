@@ -103,7 +103,7 @@
           inherit gmcli;
           default = gmcli;
         }
-        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           inherit gmcli-viewer;
         }
     );
@@ -120,7 +120,7 @@
           };
           default = self.apps.${system}.gmcli;
         }
-        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           viewer = {
             type = "app";
             program = nixpkgs.lib.getExe self.packages.${system}.gmcli-viewer;
